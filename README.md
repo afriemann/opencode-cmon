@@ -2,6 +2,8 @@
 
 Tracks what opencode costs per calendar month, per agent (sub-agents included), in a local SQLite database. opencode V2 only.
 
+<img width="400" height="124" alt="image" src="https://github.com/user-attachments/assets/a62db5d4-4a1a-486d-9880-f5c43b232b2b" />
+
 - **Server plugin** (`.`): records every completed or failed model step and every compaction into `~/.local/share/opencode/cmon.db` (WAL, safe for several opencode processes), keyed by message ID. On first start it backfills up to 6 months from opencode's own `opencode.db` (read-only). Rows older than 6 calendar months are pruned on startup and every 24 h.
 - **TUI plugin** (`./tui`): a collapsible block in the sidebar and the home footer. Wrapped by default: `▸ This month: $12.34`. Opened: cost per agent. Click the header to toggle; the state is shared and persisted. In the sidebar, the opened block has a `View [Agents] Models Providers` row: click a tab to show cost per agent, per model id, or per provider (not persisted; defaults to Agents on each start). The footer always lists agents.
 

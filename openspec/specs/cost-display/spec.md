@@ -81,3 +81,13 @@ The TUI SHALL claim `sidebar.content` with `prepend` so the cost block renders a
 
 - **WHEN** the TUI plugin sets up
 - **THEN** its sidebar slot claim uses `prepend: "sidebar.content"`
+
+### Requirement: Totals include the cache-write add-on
+
+The summary SHALL report totals and per-agent amounts as the sum of `cost_micros` and the cache-write add-on.
+
+#### Scenario: Summary shows the corrected figure
+
+- **GIVEN** a row with cost 100,000 and add-on 50,000 micro-USD
+- **WHEN** the summary is requested
+- **THEN** the total and the agent amount are 150,000 micro-USD

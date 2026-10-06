@@ -10,10 +10,11 @@ export interface StoreOptions {
 }
 
 /** Bumped whenever the on-disk schema changes. */
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const BACKFILL_MARKER = "backfill_done";
+const CORRECTION_MARKER = "cache_write_correction_done";
 
 export function opencodeDataDir(
   env: Record<string, string | undefined> = process.env,
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS cost_entry (
   kind TEXT NOT NULL CHECK (kind IN ('step','compaction')),
   failed INTEGER NOT NULL DEFAULT 0,
   cost_micros INTEGER NOT NULL,
+  cache_write_extra_micros INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   source TEXT NOT NULL CHECK (source IN ('live','backfill'))
 );
@@ -47,8 +49,8 @@ CREATE INDEX IF NOT EXISTS cost_entry_created_at ON cost_entry(created_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `;
 
-const INSERT_COLUMNS = `(id, session_id, parent_session_id, agent, provider_id, model_id, kind, failed, cost_micros, created_at, source)
-VALUES ($id, $sessionId, $parentSessionId, $agent, $providerId, $modelId, $kind, $failed, $costMicros, $createdAt, $source)`;
+const INSERT_COLUMNS = `(id, session_id, parent_session_id, agent, provider_id, model_id, kind, failed, cost_micros, cache_write_extra_micros, created_at, source)
+VALUES ($id, $sessionId, $parentSessionId, $agent, $providerId, $modelId, $kind, $failed, $costMicros, $cacheWriteExtraMicros, $createdAt, $source)`;
 
 function bindings(row: CostRow, source: "live" | "backfill") {
   return {
@@ -61,6 +63,7 @@ function bindings(row: CostRow, source: "live" | "backfill") {
     $kind: row.kind,
     $failed: row.failed ? 1 : 0,
     $costMicros: row.costMicros,
+    $cacheWriteExtraMicros: row.cacheWriteExtraMicros,
     $createdAt: row.createdAt,
     $source: source,
   };
@@ -88,19 +91,35 @@ export class Store {
     }
   }
 
-  private migrate(): void {
-    const version = (
+  private schemaVersion(): number {
+    return (
       this.db.query("PRAGMA user_version").get() as { user_version: number }
     ).user_version;
-    if (version > CURRENT_SCHEMA_VERSION) {
-      throw new Error(
-        `cmon.db schema version ${version} is newer than supported ${CURRENT_SCHEMA_VERSION}`,
-      );
-    }
-    if (version < CURRENT_SCHEMA_VERSION) {
-      this.db.exec(SCHEMA);
-      this.db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
-    }
+  }
+
+  /**
+   * Upgrades to the current schema. The version is re-read under an immediate write lock so
+   * processes starting together upgrade exactly once.
+   */
+  private migrate(): void {
+    if (this.schemaVersion() === CURRENT_SCHEMA_VERSION) return;
+    this.db
+      .transaction(() => {
+        const version = this.schemaVersion();
+        if (version > CURRENT_SCHEMA_VERSION) {
+          throw new Error(
+            `cmon.db schema version ${version} is newer than supported ${CURRENT_SCHEMA_VERSION}`,
+          );
+        }
+        if (version === 0) this.db.exec(SCHEMA);
+        if (version === 1) {
+          this.db.exec(
+            "ALTER TABLE cost_entry ADD COLUMN cache_write_extra_micros INTEGER NOT NULL DEFAULT 0",
+          );
+        }
+        this.db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
+      })
+      .immediate();
   }
 
   /** Incremented on every change made through this instance; lets the TUI detect staleness. */
@@ -120,6 +139,8 @@ export class Store {
            session_id = excluded.session_id, parent_session_id = excluded.parent_session_id,
            agent = excluded.agent, provider_id = excluded.provider_id, model_id = excluded.model_id,
            kind = excluded.kind, failed = excluded.failed, cost_micros = excluded.cost_micros,
+           cache_write_extra_micros = CASE WHEN excluded.cache_write_extra_micros > 0
+             THEN excluded.cache_write_extra_micros ELSE cost_entry.cache_write_extra_micros END,
            created_at = excluded.created_at, source = excluded.source
          WHERE cost_entry.source = 'backfill' OR cost_entry.agent = 'unknown'`,
       )
@@ -150,11 +171,39 @@ export class Store {
     return imported;
   }
 
+  isCorrectionDone(): boolean {
+    return this.getMeta(CORRECTION_MARKER) !== undefined;
+  }
+
+  /**
+   * Sets the add-on of existing rows that still have none, then sets the marker, in one write
+   * transaction. The marker is re-checked under the lock so concurrent processes apply it once;
+   * returns whether any row changed.
+   */
+  applyCacheWriteCorrection(
+    updates: ReadonlyArray<{ id: string; micros: number }>,
+  ): boolean {
+    const update = this.db.query(
+      "UPDATE cost_entry SET cache_write_extra_micros = $micros WHERE id = $id AND cache_write_extra_micros = 0",
+    );
+    const apply = this.db.transaction((): boolean => {
+      if (this.isCorrectionDone()) return false;
+      let changed = 0;
+      for (const { id, micros } of updates)
+        changed += update.run({ $id: id, $micros: micros }).changes;
+      this.setMeta(CORRECTION_MARKER, String(Date.now()));
+      return changed > 0;
+    });
+    const changed = apply.immediate();
+    if (changed) this.revisionCounter += 1;
+    return changed;
+  }
+
   /** Total and per-agent sums over `[from, to)`, largest agent first then by name. */
   summary(from: number, to: number): Summary {
     const agents = this.db
       .query(
-        `SELECT agent, SUM(cost_micros) AS micros FROM cost_entry
+        `SELECT agent, SUM(cost_micros + cache_write_extra_micros) AS micros FROM cost_entry
          WHERE created_at >= $from AND created_at < $to
          GROUP BY agent ORDER BY micros DESC, agent ASC`,
       )

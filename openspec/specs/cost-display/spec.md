@@ -122,3 +122,13 @@ The opened sidebar block SHALL show a toggle row, distinct in colour from the br
 
 - **WHEN** the breakdown is switched to models
 - **THEN** the open/closed state and the home footer are unchanged and the choice is not persisted
+
+### Requirement: Sidebar tolerates a summary without a model list
+
+The sidebar SHALL show no breakdown lines, and SHALL NOT throw, when the by-model breakdown is selected and the received summary has no model list.
+
+#### Scenario: Summary from an older server
+
+- **GIVEN** a summary that has agents but no model list
+- **WHEN** the by-model breakdown is selected
+- **THEN** no lines are shown and nothing throws

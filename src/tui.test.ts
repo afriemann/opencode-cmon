@@ -1,6 +1,7 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-display/spec.md
 // spec: openspec/changes/refine-cost-display/specs/cost-display/spec.md
 // spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
+// spec: openspec/changes/fix-missing-models-crash/specs/cost-display/spec.md
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { createRoot } from "solid-js";
 import plugin, {
@@ -176,6 +177,12 @@ describe("opened block", () => {
       { label: "openai/gpt-5-mini", amount: "$3.34" },
     ]);
     expect(breakdownLines({ kind: "error" }, "model")).toEqual([]);
+  });
+
+  test("Summary from an older server", () => {
+    const older = { ...SUMMARY, models: undefined };
+    const state = { kind: "ready", summary: older } as unknown as FeedState;
+    expect(breakdownLines(state, "model")).toEqual([]);
   });
 
   test("Default breakdown is by agent", () => {

@@ -1,6 +1,7 @@
 # cost-recording Specification
 
 ## Purpose
+
 TBD - created by archiving change add-monthly-cost-tracking. Update Purpose after archive.
 
 ## Requirements

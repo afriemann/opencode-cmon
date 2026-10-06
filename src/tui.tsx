@@ -126,14 +126,36 @@ export function createOpenState(storage: OpenStateStorage) {
   return { view, toggle };
 }
 
-export function agentLines(
+export type Breakdown = "agent" | "model";
+
+export function breakdownLines(
   state: FeedState,
-): ReadonlyArray<{ agent: string; amount: string }> {
+  breakdown: Breakdown,
+): ReadonlyArray<{ label: string; amount: string }> {
   if (state.kind !== "ready") return [];
-  return state.summary.agents.map((entry) => ({
-    agent: entry.agent,
-    amount: formatUsd(entry.micros),
-  }));
+  const { agents, models } = state.summary;
+  return breakdown === "agent"
+    ? agents.map((e) => ({ label: e.agent, amount: formatUsd(e.micros) }))
+    : models.map((e) => ({ label: e.model, amount: formatUsd(e.micros) }));
+}
+
+const BREAKDOWN_LABELS: ReadonlyArray<readonly [Breakdown, string]> = [
+  ["agent", "Agents"],
+  ["model", "Models"],
+];
+
+/** Toggle row pieces; the active one is bracketed and bold so it reads without colour. */
+export function toggleSegments(
+  active: Breakdown,
+): ReadonlyArray<{ text: string; bold: boolean }> {
+  return [
+    { text: "View", bold: false },
+    ...BREAKDOWN_LABELS.map(([mode, label]) =>
+      mode === active
+        ? { text: `[${label}]`, bold: true }
+        : { text: label, bold: false },
+    ),
+  ];
 }
 
 function useCostBlock(context: Plugin.Context) {
@@ -146,6 +168,10 @@ export function CostSidebar(props: {
 }): JSX.Element {
   const { feed, view, toggle } = useCostBlock(props.context);
   const theme = props.context.theme;
+  const [breakdown, setBreakdown] = createSignal<Breakdown>("agent");
+  const flip = (): void => {
+    setBreakdown((mode) => (mode === "agent" ? "model" : "agent"));
+  };
   return (
     <box>
       <box flexDirection="row" gap={1} onMouseDown={toggle}>
@@ -166,11 +192,22 @@ export function CostSidebar(props: {
         </text>
       </box>
       <Show when={view.open}>
-        <For each={agentLines(feed.state())}>
+        <Show when={feed.state().kind === "ready"}>
+          <box flexDirection="row" gap={2} paddingLeft={2} onMouseDown={flip}>
+            <For each={toggleSegments(breakdown())}>
+              {(segment) => (
+                <text fg={theme.text.action.primary.base}>
+                  {segment.bold ? <b>{segment.text}</b> : segment.text}
+                </text>
+              )}
+            </For>
+          </box>
+        </Show>
+        <For each={breakdownLines(feed.state(), breakdown())}>
           {(line) => (
             <box flexDirection="row" gap={1} paddingLeft={2}>
               <text fg={theme.text.muted} flexGrow={1} truncate>
-                {line.agent}
+                {line.label}
               </text>
               <text fg={theme.text.muted}>{line.amount}</text>
             </box>

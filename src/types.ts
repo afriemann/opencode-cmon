@@ -27,8 +27,15 @@ export interface AgentTotal {
   readonly micros: number;
 }
 
+export interface ModelTotal {
+  /** `providerId/modelId`. */
+  readonly model: string;
+  readonly micros: number;
+}
+
 export interface Summary {
   readonly revision: number;
   readonly totalMicros: number;
   readonly agents: readonly AgentTotal[];
+  readonly models: readonly ModelTotal[];
 }

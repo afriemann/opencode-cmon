@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { AgentTotal, CostRow, Summary } from "./types";
+import type { AgentTotal, CostRow, ModelTotal, Summary } from "./types";
 
 export interface StoreOptions {
   dbPath?: string;
@@ -202,17 +202,32 @@ export class Store {
     return changed;
   }
 
-  /** Total and per-agent sums over `[from, to)`, largest agent first then by name. */
-  summary(from: number, to: number): Summary {
-    const agents = this.db
+  private totalsBy<T>(
+    column: string,
+    alias: string,
+    from: number,
+    to: number,
+  ): T[] {
+    return this.db
       .query(
-        `SELECT agent, SUM(cost_micros + cache_write_extra_micros) AS micros FROM cost_entry
+        `SELECT ${column} AS ${alias}, SUM(cost_micros + cache_write_extra_micros) AS micros FROM cost_entry
          WHERE created_at >= $from AND created_at < $to
-         GROUP BY agent ORDER BY micros DESC, agent ASC`,
+         GROUP BY ${alias} ORDER BY micros DESC, ${alias} ASC`,
       )
-      .all({ $from: from, $to: to }) as AgentTotal[];
+      .all({ $from: from, $to: to }) as T[];
+  }
+
+  /** Total, per-agent and per-`provider/model` sums over `[from, to)`, largest first then by name. */
+  summary(from: number, to: number): Summary {
+    const agents = this.totalsBy<AgentTotal>("agent", "agent", from, to);
+    const models = this.totalsBy<ModelTotal>(
+      "provider_id || '/' || model_id",
+      "model",
+      from,
+      to,
+    );
     const totalMicros = agents.reduce((sum, entry) => sum + entry.micros, 0);
-    return { revision: this.revisionCounter, totalMicros, agents };
+    return { revision: this.revisionCounter, totalMicros, agents, models };
   }
 
   /** Deletes rows older than `cutoff`; returns how many were removed. */

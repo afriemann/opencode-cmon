@@ -4,6 +4,7 @@
 // spec: openspec/changes/account-for-cache-writes/specs/cost-display/spec.md
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-display/spec.md
+// spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -114,6 +115,37 @@ describe("store", () => {
         { agent: "zeta", micros: 5 },
       ],
     });
+  });
+
+  test("Models are grouped by provider and model", () => {
+    const store = open();
+    const m = (
+      id: string,
+      providerId: string,
+      modelId: string,
+      costMicros: number,
+      extra = 0,
+    ) =>
+      row({
+        id,
+        providerId,
+        modelId,
+        costMicros,
+        cacheWriteExtraMicros: extra,
+      });
+    store.upsertLive(m("a", "p", "m1", 10));
+    store.upsertLive(m("b", "p", "m1", 10, 5));
+    store.upsertLive(m("c", "p", "m2", 25));
+    store.upsertLive(m("d", "q", "m1", 25));
+    const summary = store.summary(0, 10_000);
+    expect(summary.models).toEqual([
+      { model: "p/m1", micros: 25 },
+      { model: "p/m2", micros: 25 },
+      { model: "q/m1", micros: 25 },
+    ]);
+    expect(summary.models.reduce((sum, e) => sum + e.micros, 0)).toBe(
+      summary.totalMicros,
+    );
   });
 
   test("Old rows are removed at startup", () => {

@@ -14,7 +14,8 @@ export const CURRENT_SCHEMA_VERSION = 2;
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const BACKFILL_MARKER = "backfill_done";
-const CORRECTION_MARKER = "cache_write_correction_done";
+/** Versioned: bump it when the correction's preconditions change so existing databases rerun it. */
+const CORRECTION_MARKER = "cache_write_correction_v2_done";
 
 export function opencodeDataDir(
   env: Record<string, string | undefined> = process.env,

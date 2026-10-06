@@ -135,11 +135,13 @@ export function parseCatalog(response: unknown): PriceTable {
   return table;
 }
 
-/** True when the catalog carries at least one priced Copilot model (a partial catalog may not). */
-export function hasCopilotPrices(table: PriceTable): boolean {
+/**
+ * True when the catalog carries a priced Copilot Claude model. A partly loaded catalog can hold
+ * other Copilot models first, so anything weaker would let the one-time correction run too early.
+ */
+export function hasCopilotClaudePrices(table: PriceTable): boolean {
   for (const price of table.values()) {
-    if (price.providerId === COPILOT_PROVIDER && price.cost.length > 0)
-      return true;
+    if (isCopilotClaude(price) && price.cost.length > 0) return true;
   }
   return false;
 }

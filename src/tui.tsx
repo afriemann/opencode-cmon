@@ -33,7 +33,7 @@ export interface CostRpcClient {
 const SAFETY_NET_INTERVAL_MS = 60_000;
 const FOOTER_AGENT_LIMIT = 2;
 const LOADING = "…";
-const FAILED = "—";
+const FAILED = "Error";
 
 export interface CostFeed {
   readonly state: Accessor<FeedState>;
@@ -71,11 +71,11 @@ export function createCostFeed(
   return { state };
 }
 
-function glyph(open: boolean): string {
-  return open ? "▾" : "▸";
+export function glyph(open: boolean): string {
+  return open ? "▼" : "▶";
 }
 
-function amount(state: FeedState): string {
+export function amount(state: FeedState): string {
   switch (state.kind) {
     case "loading":
       return LOADING;
@@ -84,10 +84,6 @@ function amount(state: FeedState): string {
     case "ready":
       return formatUsd(state.summary.totalMicros);
   }
-}
-
-export function sidebarHeader(state: FeedState, open: boolean): string {
-  return `${glyph(open)} This month: ${amount(state)}`;
 }
 
 /** Single-line footer: never grows the footer, even when opened. */
@@ -152,9 +148,21 @@ export function CostSidebar(props: {
   const theme = props.context.theme;
   return (
     <box>
-      <box onMouseDown={toggle}>
+      <box flexDirection="row" gap={1} onMouseDown={toggle}>
+        <text fg={theme.text.base}>{glyph(view.open)}</text>
         <text fg={theme.text.base}>
-          {sidebarHeader(feed.state(), view.open)}
+          <b>This month</b>
+          {": "}
+          <span
+            style={{
+              fg:
+                feed.state().kind === "error"
+                  ? theme.text.feedback.error.base
+                  : theme.text.base,
+            }}
+          >
+            {amount(feed.state())}
+          </span>
         </text>
       </box>
       <Show when={view.open}>
@@ -179,7 +187,14 @@ export function CostFooter(props: {
   const { feed, view, toggle } = useCostBlock(props.context);
   return (
     <box onMouseDown={toggle}>
-      <text fg={props.context.theme.text.muted} truncate>
+      <text
+        fg={
+          feed.state().kind === "error"
+            ? props.context.theme.text.feedback.error.base
+            : props.context.theme.text.muted
+        }
+        truncate
+      >
         {footerLine(feed.state(), view.open)}
       </text>
     </box>
@@ -190,7 +205,7 @@ export default Plugin.define({
   id: "opencode-cmon-tui",
   setup(context) {
     const sidebar = context.ui.slot({
-      append: "sidebar.content",
+      prepend: "sidebar.content",
       render: () => <CostSidebar context={context} />,
     });
     const footer = context.ui.slot({

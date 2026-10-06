@@ -122,10 +122,32 @@ export function runBackfill(store: Store, options: BackfillOptions): void {
   }
 }
 
+const CLAUDE_ID_PREFIX = "claude-";
+const COPILOT_PROVIDER = "github-copilot";
+/** Last deferral message per store, so retries on every catalog update do not repeat the same line. */
+const lastDeferral = new WeakMap<Store, string>();
+
+/** Copilot Claude models that have cache-write tokens in the data but no priced catalog entry. */
+function unpricedModels(
+  rows: readonly SourceRow[],
+  prices: PriceTable,
+): string[] {
+  const missing = new Set<string>();
+  for (const row of rows) {
+    if ((row.tokens_cache_write ?? 0) <= 0) continue;
+    if (row.provider_id !== COPILOT_PROVIDER) continue;
+    if (!row.model_id?.startsWith(CLAUDE_ID_PREFIX)) continue;
+    const price = prices.get(priceKey(row.provider_id, row.model_id));
+    if (!price || price.cost.length === 0) missing.add(row.model_id);
+  }
+  return [...missing].sort();
+}
+
 /**
  * One-time correction of existing rows: sets the cache-write add-on from the source message's model
- * and tokens. Waits for a non-empty catalog and fails soft, leaving the marker unset so a later
- * start or catalog refresh retries. Returns whether any row changed.
+ * and tokens, for every row whose model is priced. The marker is set only once every Copilot Claude
+ * model with cache-write tokens in the data is priced, so models missing from the catalog keep the
+ * correction rerunning (idempotently). Fails soft. Returns whether any row changed.
  */
 export function runCacheWriteCorrection(
   store: Store,
@@ -136,13 +158,25 @@ export function runCacheWriteCorrection(
   try {
     if (!existsSync(options.sourcePath))
       throw new Error(`source database not found: ${options.sourcePath}`);
-    const updates = mapRows(
-      readSourceRows(options.sourcePath, options.cutoff),
-      options.prices,
-    )
+    const source = readSourceRows(options.sourcePath, options.cutoff);
+    const unpriced = unpricedModels(source, options.prices);
+    const updates = mapRows(source, options.prices)
       .filter((row) => row.cacheWriteExtraMicros > 0)
       .map((row) => ({ id: row.id, micros: row.cacheWriteExtraMicros }));
-    return store.applyCacheWriteCorrection(updates);
+    const changedRows = store.applyCacheWriteCorrection(
+      updates,
+      unpriced.length === 0,
+    );
+    if (changedRows > 0)
+      options.log(`cache-write correction: priced ${changedRows} rows`);
+    if (unpriced.length > 0) {
+      const message = `cache-write correction incomplete: no price for ${unpriced.join(", ")} (catalog has ${options.prices.size} models)`;
+      if (lastDeferral.get(store) !== message) {
+        lastDeferral.set(store, message);
+        options.log(message);
+      }
+    }
+    return changedRows > 0;
   } catch (error) {
     options.log(`cache-write correction skipped, will retry: ${String(error)}`);
     return false;

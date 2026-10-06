@@ -1,5 +1,6 @@
 import { Plugin } from "@opencode/plugin";
-import { runBackfill } from "./backfill";
+import { runBackfill, runCacheWriteCorrection } from "./backfill";
+import { createPriceLookup } from "./pricing";
 import { createRecorder, type CostEvent } from "./recorder";
 import { CostRpc } from "./rpc";
 import { opencodeDataDir, Store } from "./store";
@@ -37,11 +38,15 @@ export default Plugin.define({
     const sourcePath =
       stringOption(options, "sourceDbPath") ??
       join(opencodeDataDir(), "opencode.db");
-    runBackfill(store, {
+    const lookup = createPriceLookup(() => ctx.model.list(), log);
+    const backfillOptions = async () => ({
       sourcePath,
       cutoff: retentionCutoff(new Date()),
+      prices: await lookup.current(),
       log,
     });
+    runBackfill(store, await backfillOptions());
+    runCacheWriteCorrection(store, await backfillOptions());
     store.prune(retentionCutoff(new Date()));
 
     const rpc = await ctx.rpc.register(CostRpc, {
@@ -74,8 +79,21 @@ export default Plugin.define({
         };
         return session.parentID ?? null;
       },
+      prices: () => lookup.current(),
       now: Date.now,
     });
+
+    let correcting = false;
+    const correctAfterCatalogChange = async (): Promise<void> => {
+      if (correcting || store.isCorrectionDone()) return;
+      correcting = true;
+      try {
+        if (runCacheWriteCorrection(store, await backfillOptions()))
+          await notify();
+      } finally {
+        correcting = false;
+      }
+    };
 
     const abort = new AbortController();
     const loop = (async () => {
@@ -84,6 +102,11 @@ export default Plugin.define({
           signal: abort.signal,
         })) {
           try {
+            if (event.type === "model.updated") {
+              lookup.invalidate();
+              await correctAfterCatalogChange();
+              continue;
+            }
             const row = await recorder.handle(event as CostEvent);
             if (row) {
               store.upsertLive(row);

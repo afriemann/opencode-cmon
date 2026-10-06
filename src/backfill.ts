@@ -1,13 +1,21 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { usdToMicros } from "./money";
+import {
+  cacheWriteExtraMicros,
+  hasCopilotPrices,
+  priceKey,
+  type PriceTable,
+} from "./pricing";
 import type { Store } from "./store";
-import type { CostRow } from "./types";
+import { COMPACTION_AGENT, UNKNOWN, type CostRow } from "./types";
 
 export interface BackfillOptions {
   readonly sourcePath: string;
   /** Epoch ms; messages created before this are not imported. */
   readonly cutoff: number;
+  /** Snapshot of model prices; without Copilot prices no add-on can be computed. */
+  readonly prices: PriceTable;
   readonly log: (message: string) => void;
 }
 
@@ -22,12 +30,12 @@ interface SourceRow {
   status: string | null;
   cost: number | null;
   has_tokens: number;
+  tokens_input: number | null;
+  tokens_cache_read: number | null;
+  tokens_cache_write: number | null;
   created: number | null;
   parent_id: string | null;
 }
-
-const UNKNOWN = "unknown";
-const COMPACTION_AGENT = "compaction";
 
 function readSourceRows(sourcePath: string, cutoff: number): SourceRow[] {
   const db = new Database(sourcePath, { readonly: true });
@@ -42,6 +50,9 @@ function readSourceRows(sourcePath: string, cutoff: number): SourceRow[] {
                 json_extract(m.data, '$.status') AS status,
                 json_extract(m.data, '$.cost') AS cost,
                 json_extract(m.data, '$.tokens') IS NOT NULL AS has_tokens,
+                json_extract(m.data, '$.tokens.input') AS tokens_input,
+                json_extract(m.data, '$.tokens.cache.read') AS tokens_cache_read,
+                json_extract(m.data, '$.tokens.cache.write') AS tokens_cache_write,
                 json_extract(m.data, '$.time.created') AS created
          FROM session_message m LEFT JOIN session_v2 s ON s.id = m.session_id
          WHERE m.type IN ('assistant', 'compaction') AND m.time_created >= $cutoff
@@ -54,7 +65,7 @@ function readSourceRows(sourcePath: string, cutoff: number): SourceRow[] {
 }
 
 /** Maps source messages to rows using the same rules as the live recorder. */
-function mapRows(rows: readonly SourceRow[]): CostRow[] {
+function mapRows(rows: readonly SourceRow[], prices: PriceTable): CostRow[] {
   const lastAgent = new Map<string, string>();
   const result: CostRow[] = [];
   for (const row of rows) {
@@ -63,6 +74,8 @@ function mapRows(rows: readonly SourceRow[]): CostRow[] {
     if (typeof row.cost !== "number" || !row.has_tokens) continue;
     if (!isStep && row.status !== "completed" && row.status !== "failed")
       continue;
+    const providerId = row.provider_id ?? UNKNOWN;
+    const modelId = row.model_id ?? UNKNOWN;
     result.push({
       id: row.id,
       sessionId: row.session_id,
@@ -70,11 +83,19 @@ function mapRows(rows: readonly SourceRow[]): CostRow[] {
       agent: isStep
         ? (row.agent ?? UNKNOWN)
         : (lastAgent.get(row.session_id) ?? COMPACTION_AGENT),
-      providerId: row.provider_id ?? UNKNOWN,
-      modelId: row.model_id ?? UNKNOWN,
+      providerId,
+      modelId,
       kind: isStep ? "step" : "compaction",
       failed: isStep ? false : row.status === "failed",
       costMicros: usdToMicros(row.cost),
+      cacheWriteExtraMicros: cacheWriteExtraMicros(
+        {
+          input: row.tokens_input ?? 0,
+          cacheRead: row.tokens_cache_read ?? 0,
+          cacheWrite: row.tokens_cache_write ?? 0,
+        },
+        prices.get(priceKey(providerId, modelId)),
+      ),
       createdAt: row.created ?? row.time_created,
     });
   }
@@ -91,9 +112,39 @@ export function runBackfill(store: Store, options: BackfillOptions): void {
     if (!existsSync(options.sourcePath))
       throw new Error(`source database not found: ${options.sourcePath}`);
     store.completeBackfill(
-      mapRows(readSourceRows(options.sourcePath, options.cutoff)),
+      mapRows(
+        readSourceRows(options.sourcePath, options.cutoff),
+        options.prices,
+      ),
     );
   } catch (error) {
     options.log(`backfill skipped, will retry next start: ${String(error)}`);
+  }
+}
+
+/**
+ * One-time correction of existing rows: sets the cache-write add-on from the source message's model
+ * and tokens. Waits for a non-empty catalog and fails soft, leaving the marker unset so a later
+ * start or catalog refresh retries. Returns whether any row changed.
+ */
+export function runCacheWriteCorrection(
+  store: Store,
+  options: BackfillOptions,
+): boolean {
+  if (store.isCorrectionDone() || !hasCopilotPrices(options.prices))
+    return false;
+  try {
+    if (!existsSync(options.sourcePath))
+      throw new Error(`source database not found: ${options.sourcePath}`);
+    const updates = mapRows(
+      readSourceRows(options.sourcePath, options.cutoff),
+      options.prices,
+    )
+      .filter((row) => row.cacheWriteExtraMicros > 0)
+      .map((row) => ({ id: row.id, micros: row.cacheWriteExtraMicros }));
+    return store.applyCacheWriteCorrection(updates);
+  } catch (error) {
+    options.log(`cache-write correction skipped, will retry: ${String(error)}`);
+    return false;
   }
 }

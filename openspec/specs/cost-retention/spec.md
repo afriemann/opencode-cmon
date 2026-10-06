@@ -63,86 +63,43 @@ The plugin MUST NOT write to `opencode.db`.
 - **WHEN** the backfill opens `opencode.db`
 - **THEN** the connection is read-only
 
-### Requirement: Backfilled rows carry the cache-write add-on
+### Requirement: Backfilled rows carry token counts
 
-The plugin SHALL compute the add-on for backfilled messages from their stored token counts using the same rule as live recording.
+The plugin SHALL store the input, cache-read and cache-write token counts of backfilled messages.
 
-#### Scenario: Backfill computes the add-on
+#### Scenario: Backfill stores tokens
 
-- **GIVEN** a source assistant message of a Copilot Claude model with cache-write tokens
-- **WHEN** the backfill runs with a loaded catalog
-- **THEN** the imported row carries the add-on
+- **GIVEN** a source assistant message with token counts
+- **WHEN** the backfill runs
+- **THEN** the imported row carries those counts
 
-### Requirement: Existing rows are corrected once
+### Requirement: Missing token counts are filled from opencode.db
 
-The plugin SHALL, whenever `opencode.db` is readable and the price catalog contains a priced `github-copilot` Claude model and until it is complete, set the add-on of existing rows whose add-on is 0 from the source message's model and tokens, for every row whose model is priced, and SHALL set a correction marker in the same transaction only when every `github-copilot` Claude model that has cache-write tokens in the source data has a priced catalog entry, running after backfill and before prune. A marker written by an earlier plugin version that corrected against an incomplete catalog MUST NOT suppress the correction. The correction SHALL log how many rows it priced, or which models remain unpriced, without repeating an unchanged message.
+The plugin SHALL, on every start while rows without token counts exist, read their messages from `opencode.db` by id through a read-only connection and set the counts of rows that still have none, writing zeros only for messages confirmed absent or without token data by a successful read.
 
-#### Scenario: Existing rows are corrected
+#### Scenario: Fill sets tokens
 
-- **GIVEN** live and backfilled rows with add-on 0 that have source messages
-- **WHEN** the correction runs with a loaded catalog
-- **THEN** their add-ons are set, the marker is set and `changed` is emitted
+- **GIVEN** rows with NULL token counts whose source messages have tokens
+- **WHEN** the plugin starts
+- **THEN** the counts are set
 
-#### Scenario: Correction is idempotent
+#### Scenario: Fill is idempotent without a marker
 
-- **WHEN** the correction runs a second time
-- **THEN** no row changes
+- **WHEN** the fill runs again
+- **THEN** no row changes and the source is not opened when no row lacks tokens
 
-#### Scenario: Empty catalog defers the correction
+#### Scenario: Unavailable source writes nothing
 
-- **WHEN** the catalog is empty
-- **THEN** nothing changes and the marker stays unset
+- **WHEN** `opencode.db` is missing, locked or malformed
+- **THEN** a warning is logged, no counts are written and the next start retries
 
-#### Scenario: A catalog without Copilot prices defers the correction
+#### Scenario: A confirmed-absent message gets zero tokens
 
-- **WHEN** the catalog has models but none from `github-copilot` with a cost entry
-- **THEN** nothing changes and the marker stays unset
+- **GIVEN** a row whose id is absent from a successfully read source
+- **WHEN** the fill runs
+- **THEN** its counts are set to 0
 
-#### Scenario: A catalog with Copilot but no Claude prices defers the correction
+#### Scenario: Concurrent fills apply once
 
-- **WHEN** the catalog has priced `github-copilot` models but none of them is Claude
-- **THEN** nothing changes and the marker stays unset
-
-#### Scenario: An unpriced model does not block pricing the others
-
-- **GIVEN** source messages of `claude-sonnet-4.6` and `claude-opus-9` with cache-write tokens and a catalog that prices only the first
-- **WHEN** the correction runs
-- **THEN** the `claude-sonnet-4.6` rows are corrected, the `claude-opus-9` rows keep add-on 0, the marker stays unset and the log names `claude-opus-9`
-
-#### Scenario: A repeated deferral is logged once
-
-- **WHEN** the correction runs again with the same unpriced models
-- **THEN** the deferral message is not logged again
-
-#### Scenario: A successful correction logs what it priced
-
-- **WHEN** the correction completes
-- **THEN** it logs the number of rows priced
-
-#### Scenario: A premature earlier marker does not suppress the correction
-
-- **GIVEN** a database whose only marker is the one set by the earlier plugin version
-- **WHEN** the correction runs with a catalog containing a priced Copilot Claude model
-- **THEN** the add-ons are set and the new marker is set
-
-#### Scenario: Missing source fails soft
-
-- **WHEN** `opencode.db` is missing or malformed
-- **THEN** a warning is logged, the marker stays unset and nothing throws
-
-#### Scenario: Rows without a source message keep zero
-
-- **GIVEN** a row with no matching source message
-- **WHEN** the correction runs
-- **THEN** its add-on stays 0
-
-#### Scenario: Concurrent corrections apply once
-
-- **WHEN** two processes run the correction simultaneously
-- **THEN** each row is updated once and the marker is set
-
-#### Scenario: Catalog refresh triggers a deferred correction
-
-- **GIVEN** the catalog was empty at startup
-- **WHEN** a `model.updated` event arrives with a full catalog
-- **THEN** the correction runs and `changed` is emitted
+- **WHEN** two processes run the fill simultaneously
+- **THEN** each row is updated once

@@ -2,6 +2,7 @@
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
 // spec: openspec/changes/refine-cost-display/specs/cost-display/spec.md
 // spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
+// spec: openspec/changes/retry-feed-on-error/specs/cost-display/spec.md
 // spec: openspec/changes/fix-missing-models-crash/specs/cost-display/spec.md
 // spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
 import { afterEach, describe, expect, jest, test } from "bun:test";
@@ -113,6 +114,104 @@ describe("cost feed", () => {
       expect(calls.length).toBe(3);
       dispose();
     });
+  });
+
+  test("Recovers after a transient failure", async () => {
+    jest.useFakeTimers();
+    let failing = true;
+    const { client, calls } = fakeClient(async () => {
+      if (failing) throw new Error("not registered yet");
+      return SUMMARY;
+    });
+    await createRoot(async (dispose) => {
+      const feed = createCostFeed(client);
+      await flush();
+      expect(feed.state()).toEqual({ kind: "error" });
+      failing = false;
+      jest.advanceTimersByTime(5_000);
+      await flush();
+      expect(calls.length).toBe(2);
+      expect(feed.state()).toEqual({ kind: "ready", summary: SUMMARY });
+      dispose();
+    });
+  });
+
+  test("Keeps retrying while the RPC is down", async () => {
+    jest.useFakeTimers();
+    let pending = 0;
+    let overlap = false;
+    const { client, calls } = fakeClient(async () => {
+      pending += 1;
+      overlap ||= pending > 1;
+      await Promise.resolve();
+      pending -= 1;
+      throw new Error("down");
+    });
+    await createRoot(async (dispose) => {
+      createCostFeed(client);
+      await flush();
+      expect(calls.length).toBe(1);
+      for (let n = 2; n <= 4; n += 1) {
+        jest.advanceTimersByTime(5_000);
+        await flush();
+        expect(calls.length).toBe(n);
+      }
+      expect(overlap).toBe(false);
+      dispose();
+    });
+  });
+
+  test("No retry once ready", async () => {
+    jest.useFakeTimers();
+    let failing = true;
+    const { client, calls } = fakeClient(async () => {
+      if (failing) throw new Error("down");
+      return SUMMARY;
+    });
+    await createRoot(async (dispose) => {
+      createCostFeed(client);
+      await flush();
+      failing = false;
+      jest.advanceTimersByTime(5_000);
+      await flush();
+      jest.advanceTimersByTime(30_000);
+      await flush();
+      expect(calls.length).toBe(2);
+      dispose();
+    });
+  });
+
+  test("No retry once torn down", async () => {
+    jest.useFakeTimers();
+    const { client, calls } = fakeClient(async () => {
+      throw new Error("down");
+    });
+    await createRoot(async (dispose) => {
+      createCostFeed(client);
+      await flush();
+      dispose();
+    });
+    jest.advanceTimersByTime(30_000);
+    await flush();
+    expect(calls.length).toBe(1);
+  });
+
+  test("No retry when torn down during a request", async () => {
+    jest.useFakeTimers();
+    let reject: (error: Error) => void = () => {};
+    const { client, calls } = fakeClient(
+      () => new Promise<Summary>((_, fail) => (reject = fail)),
+    );
+    await createRoot(async (dispose) => {
+      createCostFeed(client);
+      await flush();
+      dispose();
+    });
+    reject(new Error("late failure"));
+    await flush();
+    jest.advanceTimersByTime(30_000);
+    await flush();
+    expect(calls.length).toBe(1);
   });
 });
 

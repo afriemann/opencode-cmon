@@ -31,6 +31,8 @@ export interface CostRpcClient {
 
 /** Bounded reconciliation: catches cost written by other server processes and the month rollover. */
 const SAFETY_NET_INTERVAL_MS = 60_000;
+/** While in the error state, e.g. the server restarted and the RPC is not registered yet. */
+const ERROR_RETRY_INTERVAL_MS = 5_000;
 const FOOTER_AGENT_LIMIT = 2;
 const LOADING = "…";
 const FAILED = "Error";
@@ -40,7 +42,8 @@ export interface CostFeed {
 }
 
 /**
- * Fetches the current local month's summary, refreshing on `changed` and on a safety-net interval.
+ * Fetches the current local month's summary, refreshing on `changed` and on a safety-net interval,
+ * and retrying every few seconds while in the `error` state.
  * Never throws an RPC failure into the host; it becomes the `error` state.
  */
 export function createCostFeed(
@@ -49,15 +52,26 @@ export function createCostFeed(
 ): CostFeed {
   const [state, setState] = createSignal<FeedState>({ kind: "loading" });
 
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  const cancelRetry = (): void => {
+    clearTimeout(retryTimer);
+    retryTimer = undefined;
+  };
+
   const refresh = async (): Promise<void> => {
     const [from, to] = localMonthRange(now());
     try {
-      setState({
-        kind: "ready",
-        summary: (await client.summary({ from, to })) as Summary,
-      });
+      const summary = (await client.summary({ from, to })) as Summary;
+      cancelRetry();
+      setState({ kind: "ready", summary });
     } catch {
       setState({ kind: "error" });
+      if (!disposed)
+        retryTimer ??= setTimeout(() => {
+          retryTimer = undefined;
+          void refresh();
+        }, ERROR_RETRY_INTERVAL_MS);
     }
   };
 
@@ -66,6 +80,10 @@ export function createCostFeed(
     onCleanup(client.events.on("changed", () => void refresh()));
     const timer = setInterval(() => void refresh(), SAFETY_NET_INTERVAL_MS);
     onCleanup(() => clearInterval(timer));
+    onCleanup(() => {
+      disposed = true;
+      cancelRetry();
+    });
   });
 
   return { state };

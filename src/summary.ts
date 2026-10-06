@@ -4,17 +4,19 @@ import {
   priceKey,
   type PriceTable,
 } from "./pricing";
-import type { AgentTotal, Candidate, ModelTotal } from "./types";
+import type { AgentTotal, Candidate, ModelTotal, ProviderTotal } from "./types";
 
 export interface SummaryAggregate {
   readonly agents: readonly AgentTotal[];
   readonly models: readonly ModelTotal[];
+  readonly providers: readonly ProviderTotal[];
 }
 
 export interface BuiltSummary {
   readonly totalMicros: number;
   readonly agents: AgentTotal[];
   readonly models: ModelTotal[];
+  readonly providers: ProviderTotal[];
   /** False when a row that could carry a cache-write cost has unknown tokens or no price. */
   readonly complete: boolean;
   /** `providerId/modelId` of candidates without a priced catalog entry; used to trigger a reload. */
@@ -47,6 +49,9 @@ export function buildSummary(
 ): BuiltSummary {
   const agents = new Map(aggregate.agents.map((a) => [a.agent, a.micros]));
   const models = new Map(aggregate.models.map((m) => [m.model, m.micros]));
+  const providers = new Map(
+    aggregate.providers.map((p) => [p.provider, p.micros]),
+  );
   const unpriced = new Set<string>();
   let complete = true;
 
@@ -66,7 +71,8 @@ export function buildSummary(
     const extra = cacheWriteExtraMicros(row.tokens, price);
     if (extra === 0) continue;
     agents.set(row.agent, (agents.get(row.agent) ?? 0) + extra);
-    models.set(key, (models.get(key) ?? 0) + extra);
+    models.set(row.modelId, (models.get(row.modelId) ?? 0) + extra);
+    providers.set(row.providerId, (providers.get(row.providerId) ?? 0) + extra);
   }
 
   const agentList = sorted(
@@ -81,6 +87,11 @@ export function buildSummary(
       models,
       (model, micros) => ({ model, micros }),
       (e) => e.model,
+    ),
+    providers: sorted(
+      providers,
+      (provider, micros) => ({ provider, micros }),
+      (e) => e.provider,
     ),
     complete,
     unpriced: [...unpriced].sort(),

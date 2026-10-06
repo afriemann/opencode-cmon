@@ -3,10 +3,12 @@
 // spec: openspec/changes/refine-cost-display/specs/cost-display/spec.md
 // spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
 // spec: openspec/changes/fix-missing-models-crash/specs/cost-display/spec.md
+// spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { createRoot } from "solid-js";
 import plugin, {
   breakdownLines,
+  type Breakdown,
   toggleSegments,
   createCostFeed,
   createOpenState,
@@ -31,8 +33,12 @@ const SUMMARY: Summary = {
     { agent: "general", micros: 1_220_000 },
   ],
   models: [
-    { model: "anthropic/claude-sonnet-4-5", micros: 9_000_000 },
-    { model: "openai/gpt-5-mini", micros: 3_340_000 },
+    { model: "claude-sonnet-4-5", micros: 9_000_000 },
+    { model: "gpt-5-mini", micros: 3_340_000 },
+  ],
+  providers: [
+    { provider: "anthropic", micros: 9_000_000 },
+    { provider: "openai", micros: 3_340_000 },
   ],
   complete: true,
 };
@@ -135,6 +141,7 @@ describe("cost text", () => {
           agents: [],
           models: [],
           complete: true,
+          providers: [],
         },
       }),
     ).toBe("$0.00");
@@ -159,6 +166,7 @@ describe("cost text", () => {
       agents: [{ agent: "build", micros: 100_000 }],
       models: [],
       complete: true,
+      providers: [],
     };
     expect(footerLine({ kind: "ready", summary }, true)).toBe(
       "▼ $0.10 · build $0.10",
@@ -182,25 +190,36 @@ describe("opened block", () => {
     expect(
       breakdownLines({ kind: "ready", summary: SUMMARY }, "model"),
     ).toEqual([
-      { label: "anthropic/claude-sonnet-4-5", amount: "$9.00" },
-      { label: "openai/gpt-5-mini", amount: "$3.34" },
+      { label: "claude-sonnet-4-5", amount: "$9.00" },
+      { label: "gpt-5-mini", amount: "$3.34" },
     ]);
     expect(breakdownLines({ kind: "error" }, "model")).toEqual([]);
   });
 
+  test("Clicking the Providers tab shows providers", () => {
+    expect(
+      breakdownLines({ kind: "ready", summary: SUMMARY }, "provider"),
+    ).toEqual([
+      { label: "anthropic", amount: "$9.00" },
+      { label: "openai", amount: "$3.34" },
+    ]);
+  });
+
   test("Summary from an older server", () => {
-    const older = { ...SUMMARY, models: undefined };
+    const older = { ...SUMMARY, models: undefined, providers: undefined };
     const state = { kind: "ready", summary: older } as unknown as FeedState;
     expect(breakdownLines(state, "model")).toEqual([]);
+    expect(breakdownLines(state, "provider")).toEqual([]);
   });
 
   test("Default breakdown is by agent", () => {
-    const text = (mode: "agent" | "model") =>
+    const text = (mode: Breakdown) =>
       toggleSegments(mode)
         .map((s) => s.text)
         .join("  ");
-    expect(text("agent")).toBe("View  [Agents]  Models");
-    expect(text("model")).toBe("View  Agents  [Models]");
+    expect(text("agent")).toBe("View  [Agents]  Models  Providers");
+    expect(text("model")).toBe("View  Agents  [Models]  Providers");
+    expect(text("provider")).toBe("View  Agents  Models  [Providers]");
     expect(
       toggleSegments("model")
         .filter((s) => s.bold)

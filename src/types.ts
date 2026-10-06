@@ -30,8 +30,13 @@ export interface AgentTotal {
 }
 
 export interface ModelTotal {
-  /** `providerId/modelId`. */
+  /** The model id, merged across providers. */
   readonly model: string;
+  readonly micros: number;
+}
+
+export interface ProviderTotal {
+  readonly provider: string;
   readonly micros: number;
 }
 
@@ -40,6 +45,7 @@ export interface Summary {
   readonly totalMicros: number;
   readonly agents: readonly AgentTotal[];
   readonly models: readonly ModelTotal[];
+  readonly providers: readonly ProviderTotal[];
   /** False when some row that could carry a cache-write cost could not be priced. */
   readonly complete: boolean;
 }

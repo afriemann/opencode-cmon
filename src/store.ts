@@ -3,7 +3,13 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { COPILOT_PROVIDER, type TokenCounts } from "./pricing";
-import type { AgentTotal, Candidate, CostRow, ModelTotal } from "./types";
+import type {
+  AgentTotal,
+  Candidate,
+  CostRow,
+  ModelTotal,
+  ProviderTotal,
+} from "./types";
 
 export interface StoreOptions {
   dbPath?: string;
@@ -247,7 +253,7 @@ export class Store {
   }
 
   /**
-   * Per-agent and per-`provider/model` sums of opencode's own cost over `[from, to)` plus the rows
+   * Per-agent, per-model-id and per-provider sums of opencode's own cost over `[from, to)` plus the rows
    * that may carry a cache-write cost, read in one snapshot so they agree. Ordering and the add-on
    * are applied in code (`buildSummary`).
    */
@@ -258,13 +264,15 @@ export class Store {
     revision: number;
     agents: AgentTotal[];
     models: ModelTotal[];
+    providers: ProviderTotal[];
     candidates: Candidate[];
   } {
     const read = this.db.transaction(() => {
       const agents = this.totalsBy<AgentTotal>("agent", "agent", from, to);
-      const models = this.totalsBy<ModelTotal>(
-        "provider_id || '/' || model_id",
-        "model",
+      const models = this.totalsBy<ModelTotal>("model_id", "model", from, to);
+      const providers = this.totalsBy<ProviderTotal>(
+        "provider_id",
+        "provider",
         from,
         to,
       );
@@ -296,7 +304,7 @@ export class Store {
                 cacheWrite: row.tokens_cache_write,
               },
       }));
-      return { agents, models, candidates };
+      return { agents, models, providers, candidates };
     });
     return { revision: this.revisionCounter, ...read.deferred() };
   }

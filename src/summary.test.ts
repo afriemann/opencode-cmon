@@ -1,4 +1,5 @@
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
+// spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
 import { describe, expect, test } from "bun:test";
 import { parseCatalog } from "./pricing";
 import { buildSummary } from "./summary";
@@ -24,7 +25,8 @@ const candidate = (overrides: Partial<Candidate> = {}): Candidate => ({
 
 const aggregate = (micros = 100_000) => ({
   agents: [{ agent: "build", micros }],
-  models: [{ model: "github-copilot/claude-sonnet-5.5", micros }],
+  models: [{ model: "claude-sonnet-5.5", micros }],
+  providers: [{ provider: "github-copilot", micros }],
 });
 
 describe("buildSummary", () => {
@@ -37,7 +39,10 @@ describe("buildSummary", () => {
     expect(result.totalMicros).toBe(100_000 + 50_000);
     expect(result.agents).toEqual([{ agent: "build", micros: 150_000 }]);
     expect(result.models).toEqual([
-      { model: "github-copilot/claude-sonnet-5.5", micros: 150_000 },
+      { model: "claude-sonnet-5.5", micros: 150_000 },
+    ]);
+    expect(result.providers).toEqual([
+      { provider: "github-copilot", micros: 150_000 },
     ]);
     expect(result.complete).toBe(true);
   });
@@ -101,8 +106,12 @@ describe("buildSummary", () => {
           { agent: "build", micros: 1 },
         ],
         models: [
-          { model: "github-copilot/claude-sonnet-5.5", micros: 1 },
-          { model: "p/m", micros: 20 },
+          { model: "claude-sonnet-5.5", micros: 1 },
+          { model: "m", micros: 20 },
+        ],
+        providers: [
+          { provider: "github-copilot", micros: 1 },
+          { provider: "p", micros: 20 },
         ],
       },
       [candidate({ tokens: { input: 0, cacheRead: 0, cacheWrite: 100 } })],
@@ -114,22 +123,32 @@ describe("buildSummary", () => {
       "zeta",
     ]);
     expect(result.models.map((m) => m.model)).toEqual([
-      "github-copilot/claude-sonnet-5.5",
-      "p/m",
+      "claude-sonnet-5.5",
+      "m",
+    ]);
+    expect(result.providers.map((p) => p.provider)).toEqual([
+      "github-copilot",
+      "p",
     ]);
     const sum = (list: ReadonlyArray<{ micros: number }>) =>
       list.reduce((t, e) => t + e.micros, 0);
     expect(sum(result.agents)).toBe(result.totalMicros);
     expect(sum(result.models)).toBe(result.totalMicros);
+    expect(sum(result.providers)).toBe(result.totalMicros);
   });
 
   test("a candidate missing from the aggregates gets its own buckets", () => {
     const result = buildSummary(
-      { agents: [], models: [] },
+      { agents: [], models: [], providers: [] },
       [candidate()],
       CATALOG,
     );
     expect(result.agents).toEqual([{ agent: "build", micros: 4_312_778 }]);
-    expect(result.models).toHaveLength(1);
+    expect(result.models).toEqual([
+      { model: "claude-sonnet-5.5", micros: 4_312_778 },
+    ]);
+    expect(result.providers).toEqual([
+      { provider: "github-copilot", micros: 4_312_778 },
+    ]);
   });
 });

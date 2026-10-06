@@ -127,38 +127,50 @@ export function createOpenState(storage: OpenStateStorage) {
   return { view, toggle };
 }
 
-export type Breakdown = "agent" | "model";
+export type Breakdown = "agent" | "model" | "provider";
 
 export function breakdownLines(
   state: FeedState,
   breakdown: Breakdown,
 ): ReadonlyArray<{ label: string; amount: string }> {
   if (state.kind !== "ready") return [];
-  const { agents, models } = state.summary;
-  if (breakdown === "agent")
-    return agents.map((e) => ({ label: e.agent, amount: formatUsd(e.micros) }));
-  // A server process still running an older plugin replies without `models`.
-  return (models ?? []).map((e) => ({
-    label: e.model,
-    amount: formatUsd(e.micros),
-  }));
+  const { summary } = state;
+  // A server process still running an older plugin replies without `models`/`providers`.
+  switch (breakdown) {
+    case "agent":
+      return summary.agents.map((e) => ({
+        label: e.agent,
+        amount: formatUsd(e.micros),
+      }));
+    case "model":
+      return (summary.models ?? []).map((e) => ({
+        label: e.model,
+        amount: formatUsd(e.micros),
+      }));
+    case "provider":
+      return (summary.providers ?? []).map((e) => ({
+        label: e.provider,
+        amount: formatUsd(e.micros),
+      }));
+  }
 }
 
 const BREAKDOWN_LABELS: ReadonlyArray<readonly [Breakdown, string]> = [
   ["agent", "Agents"],
   ["model", "Models"],
+  ["provider", "Providers"],
 ];
 
-/** Toggle row pieces; the active one is bracketed and bold so it reads without colour. */
+/** Toggle row pieces; the active tab is bracketed and bold so it reads without colour. */
 export function toggleSegments(
   active: Breakdown,
-): ReadonlyArray<{ text: string; bold: boolean }> {
+): ReadonlyArray<{ text: string; bold: boolean; mode?: Breakdown }> {
   return [
     { text: "View", bold: false },
     ...BREAKDOWN_LABELS.map(([mode, label]) =>
       mode === active
-        ? { text: `[${label}]`, bold: true }
-        : { text: label, bold: false },
+        ? { text: `[${label}]`, bold: true, mode }
+        : { text: label, bold: false, mode },
     ),
   ];
 }
@@ -174,9 +186,6 @@ export function CostSidebar(props: {
   const { feed, view, toggle } = useCostBlock(props.context);
   const theme = props.context.theme;
   const [breakdown, setBreakdown] = createSignal<Breakdown>("agent");
-  const flip = (): void => {
-    setBreakdown((mode) => (mode === "agent" ? "model" : "agent"));
-  };
   return (
     <box>
       <box flexDirection="row" gap={1} onMouseDown={toggle}>
@@ -198,10 +207,15 @@ export function CostSidebar(props: {
       </box>
       <Show when={view.open}>
         <Show when={feed.state().kind === "ready"}>
-          <box flexDirection="row" gap={2} paddingLeft={2} onMouseDown={flip}>
+          <box flexDirection="row" gap={2} paddingLeft={2}>
             <For each={toggleSegments(breakdown())}>
               {(segment) => (
-                <text fg={theme.text.action.primary.base}>
+                <text
+                  fg={theme.text.action.primary.base}
+                  onMouseDown={() => {
+                    if (segment.mode) setBreakdown(segment.mode);
+                  }}
+                >
                   {segment.bold ? <b>{segment.text}</b> : segment.text}
                 </text>
               )}

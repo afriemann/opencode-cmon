@@ -1,0 +1,3 @@
+[test]
+# Compile .tsx with the Solid transform the shipped build uses, so click tests run reactive code.
+preload = ["@opentui/solid/preload"]

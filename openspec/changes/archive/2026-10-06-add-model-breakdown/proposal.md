@@ -17,6 +17,7 @@ The cost block only breaks the month's spend down by agent. Users also want to s
 ### New Capabilities
 
 ### Modified Capabilities
+
 - `cost-display`: the summary gains per-model sums; the opened sidebar lists the selected breakdown and offers a toggle.
 
 ## Impact

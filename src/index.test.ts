@@ -1,7 +1,8 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-recording/spec.md
-// spec: openspec/changes/account-for-cache-writes/specs/cost-retention/spec.md
-// spec: openspec/changes/account-for-cache-writes/specs/cost-recording/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,10 +38,28 @@ const WRITE_TOKENS = {
 };
 const MODEL = { providerID: "github-copilot", id: "claude-sonnet-4.6" };
 
+interface Reply {
+  totalMicros: number;
+  agents: Array<{ agent: string; micros: number }>;
+  models: Array<{ model: string; micros: number }>;
+  complete: boolean;
+}
+
 function fakeContext(
-  options: { catalog?: unknown[]; sourceDbPath?: string } = {},
+  options: {
+    catalog?: unknown[];
+    sourceDbPath?: string;
+    hangCatalog?: boolean;
+    gatedCatalog?: boolean;
+  } = {},
 ) {
   const emitted: unknown[] = [];
+  let summaryHandler: (input: unknown) => Promise<Reply> = async () => {
+    throw new Error("rpc not registered");
+  };
+  let listCalls = 0;
+  let openGate: () => void = () => {};
+  const gate = new Promise<void>((resolve) => (openGate = resolve));
   const catalog = { data: options.catalog ?? [] };
   const pending: Array<Record<string, unknown>> = [];
   let wake: () => void = () => {};
@@ -48,20 +67,36 @@ function fakeContext(
     options: {
       dbPath,
       sourceDbPath: options.sourceDbPath ?? join(dir, "absent.db"),
+      notifyDebounceMs: 20,
     },
     rpc: {
-      register: async () => ({
-        events: {
-          emit: async (_n: string, d: unknown) => void emitted.push(d),
-        },
-        dispose: async () => {},
-      }),
+      register: async (
+        _rpc: unknown,
+        handlers: { summary: (input: unknown) => Promise<Reply> },
+      ) => {
+        summaryHandler = handlers.summary;
+        return {
+          events: {
+            emit: async (_n: string, d: unknown) => void emitted.push(d),
+          },
+          dispose: async () => {},
+        };
+      },
     },
     session: {
       get: async ({ sessionID }: { sessionID: string }) =>
         sessionID === "ses_c" ? { parentID: "ses_p" } : {},
     },
-    model: { list: async () => ({ location: {}, data: catalog.data }) },
+    model: {
+      list: () => {
+        listCalls += 1;
+        if (options.gatedCatalog)
+          return gate.then(() => ({ location: {}, data: catalog.data }));
+        return options.hangCatalog
+          ? new Promise(() => {})
+          : Promise.resolve({ location: {}, data: catalog.data });
+      },
+    },
     event: {
       subscribe: ({ signal }: { signal: AbortSignal }) => ({
         async *[Symbol.asyncIterator]() {
@@ -84,6 +119,10 @@ function fakeContext(
   return {
     ctx,
     emitted,
+    summary: (from = 0, to = Date.now() + DAY_MS) =>
+      summaryHandler({ from, to }),
+    listCalls: () => listCalls,
+    openGate: () => openGate(),
     setCatalog: (data: unknown[]) => void (catalog.data = data),
     push: (event: Record<string, unknown>) => {
       pending.push(event);
@@ -137,38 +176,55 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+const step = (id: string, tokens: unknown, cost = 0.5) => [
+  {
+    id: `s_${id}`,
+    type: "session.step.started",
+    data: {
+      sessionID: "ses_c",
+      assistantMessageID: id,
+      agent: "explore",
+      model: MODEL,
+      started: Date.now(),
+    },
+  },
+  {
+    id: `e_${id}`,
+    type: "session.step.ended",
+    data: { sessionID: "ses_c", assistantMessageID: id, cost, tokens },
+  },
+];
+
+const seedRow = (id: string, overrides: Record<string, unknown> = {}) => ({
+  id,
+  sessionId: "s",
+  parentSessionId: null,
+  agent: "build",
+  providerId: "github-copilot",
+  modelId: "claude-sonnet-4.6",
+  kind: "step" as const,
+  failed: false,
+  costMicros: 100_000,
+  tokens: null,
+  createdAt: Date.now(),
+  ...overrides,
+});
+
+const total = (store: Store): number =>
+  store
+    .summaryInputs(0, Date.now() + DAY_MS)
+    .agents.reduce((sum, a) => sum + a.micros, 0);
+
 describe("plugin", () => {
   test("records events end to end and notifies the TUI", async () => {
-    queue = [
-      {
-        id: "e1",
-        type: "session.step.started",
-        data: {
-          sessionID: "ses_c",
-          assistantMessageID: "m1",
-          agent: "explore",
-          model: { providerID: "p", id: "m" },
-          started: Date.now(),
-        },
-      },
-      {
-        id: "e2",
-        type: "session.step.ended",
-        data: {
-          sessionID: "ses_c",
-          assistantMessageID: "m1",
-          cost: 0.5,
-          tokens: TOKENS,
-        },
-      },
-    ];
+    queue = step("m1", TOKENS);
     const { ctx, emitted } = fakeContext();
     await start(ctx);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await settle();
     await cleanup?.();
     cleanup = undefined;
     const store = new Store({ dbPath });
-    expect(store.summary(0, Date.now() + DAY_MS).agents).toEqual([
+    expect(store.summaryInputs(0, Date.now() + DAY_MS).agents).toEqual([
       { agent: "explore", micros: 500_000 },
     ]);
     store.close();
@@ -177,198 +233,140 @@ describe("plugin", () => {
 
   test("Old rows are removed at startup", async () => {
     const seed = new Store({ dbPath });
-    const old = {
-      id: "old",
-      sessionId: "s",
-      parentSessionId: null,
-      agent: "a",
-      providerId: "p",
-      modelId: "m",
-      kind: "step" as const,
-      failed: false,
-      costMicros: 1,
-      cacheWriteExtraMicros: 0,
-    };
-    seed.upsertLive({ ...old, createdAt: new Date(2000, 0, 1).getTime() });
-    seed.upsertLive({ ...old, id: "new", createdAt: Date.now() });
+    seed.upsertLive(
+      seedRow("old", {
+        createdAt: new Date(2000, 0, 1).getTime(),
+        tokens: { input: 0, cacheRead: 0, cacheWrite: 0 },
+      }),
+    );
+    seed.upsertLive(
+      seedRow("new", { tokens: { input: 0, cacheRead: 0, cacheWrite: 0 } }),
+    );
     seed.close();
     await start(fakeContext().ctx);
     await cleanup?.();
     cleanup = undefined;
     const check = new Store({ dbPath });
-    expect(check.summary(0, Date.now() + DAY_MS).agents).toEqual([
-      { agent: "a", micros: 1 },
-    ]);
+    expect(total(check)).toBe(100_000);
     check.close();
   });
 
   test("Pruning repeats daily", async () => {
     jest.useFakeTimers();
-    const { ctx } = fakeContext();
-    await start(ctx);
+    await start(fakeContext().ctx);
     const seed = new Store({ dbPath });
-    seed.upsertLive({
-      id: "old",
-      sessionId: "s",
-      parentSessionId: null,
-      agent: "a",
-      providerId: "p",
-      modelId: "m",
-      kind: "step",
-      failed: false,
-      costMicros: 1,
-      cacheWriteExtraMicros: 0,
-      createdAt: new Date(2000, 0, 1).getTime(),
-    });
+    seed.upsertLive(
+      seedRow("old", {
+        createdAt: new Date(2000, 0, 1).getTime(),
+        tokens: { input: 0, cacheRead: 0, cacheWrite: 0 },
+      }),
+    );
     seed.close();
     jest.advanceTimersByTime(DAY_MS + 1);
     const check = new Store({ dbPath });
-    expect(check.summary(0, Date.now() + DAY_MS).totalMicros).toBe(0);
+    expect(total(check)).toBe(0);
     check.close();
   });
 
   test("Sonnet cache writes are priced for live events", async () => {
-    queue = [
-      {
-        id: "e1",
-        type: "session.step.started",
-        data: {
-          sessionID: "ses_c",
-          assistantMessageID: "m1",
-          agent: "build",
-          model: MODEL,
-          started: Date.now(),
-        },
-      },
-      {
-        id: "e2",
-        type: "session.step.ended",
-        data: {
-          sessionID: "ses_c",
-          assistantMessageID: "m1",
-          cost: 0.5,
-          tokens: WRITE_TOKENS,
-        },
-      },
-    ];
-    await start(fakeContext({ catalog: [SONNET_ENTRY] }).ctx);
-    await settle();
-    await cleanup?.();
-    cleanup = undefined;
-    const store = new Store({ dbPath });
-    expect(store.summary(0, Date.now() + DAY_MS).totalMicros).toBe(
-      500_000 + 2_500_000,
-    );
-    store.close();
-  });
-
-  test("Existing rows are corrected", async () => {
-    const sourceDbPath = join(dir, "opencode.db");
-    createSource(sourceDbPath);
-    const seed = new Store({ dbPath });
-    seed.completeBackfill([
-      {
-        id: "m1",
-        sessionId: "s",
-        parentSessionId: null,
-        agent: "build",
-        providerId: "github-copilot",
-        modelId: "claude-sonnet-4.6",
-        kind: "step",
-        failed: false,
-        costMicros: 100_000,
-        cacheWriteExtraMicros: 0,
-        createdAt: Date.now(),
-      },
-    ]);
-    seed.close();
-    await start(fakeContext({ catalog: [SONNET_ENTRY], sourceDbPath }).ctx);
-    await cleanup?.();
-    cleanup = undefined;
-    const store = new Store({ dbPath });
-    expect(store.summary(0, Date.now() + DAY_MS).totalMicros).toBe(
-      100_000 + 2_500_000,
-    );
-    store.close();
-  });
-
-  test("Catalog refresh triggers a deferred correction", async () => {
-    const sourceDbPath = join(dir, "opencode.db");
-    createSource(sourceDbPath);
-    const seed = new Store({ dbPath });
-    seed.completeBackfill([
-      {
-        id: "m1",
-        sessionId: "s",
-        parentSessionId: null,
-        agent: "build",
-        providerId: "github-copilot",
-        modelId: "claude-sonnet-4.6",
-        kind: "step",
-        failed: false,
-        costMicros: 100_000,
-        cacheWriteExtraMicros: 0,
-        createdAt: Date.now(),
-      },
-    ]);
-    seed.close();
-    const { ctx, emitted, setCatalog, push } = fakeContext({ sourceDbPath });
+    queue = step("m1", WRITE_TOKENS);
+    const { ctx, summary } = fakeContext({ catalog: [SONNET_ENTRY] });
     await start(ctx);
     await settle();
-    expect(emitted).toHaveLength(0);
+    const reply = await summary();
+    expect(reply.totalMicros).toBe(500_000 + 2_500_000);
+    expect(reply.agents).toEqual([{ agent: "explore", micros: 3_000_000 }]);
+    expect(reply.models).toHaveLength(1);
+    expect(reply.complete).toBe(true);
+  });
+
+  test("Fill sets tokens at startup", async () => {
+    const sourceDbPath = join(dir, "opencode.db");
+    createSource(sourceDbPath);
+    const seed = new Store({ dbPath });
+    seed.completeBackfill([seedRow("m1")]);
+    seed.close();
+    const { ctx, summary } = fakeContext({
+      catalog: [SONNET_ENTRY],
+      sourceDbPath,
+    });
+    await start(ctx);
+    await settle();
+    expect((await summary()).totalMicros).toBe(100_000 + 2_500_000);
+  });
+
+  test("The add-on follows the catalog", async () => {
+    const seed = new Store({ dbPath });
+    seed.completeBackfill([
+      seedRow("m1", {
+        tokens: { input: 0, cacheRead: 0, cacheWrite: 1_000_000 },
+      }),
+    ]);
+    seed.close();
+    const { ctx, summary, setCatalog, push, emitted } = fakeContext();
+    await start(ctx);
+    await settle();
+    const early = await summary();
+    expect(early.totalMicros).toBe(100_000);
+    expect(early.complete).toBe(false);
     setCatalog([SONNET_ENTRY]);
     push({ id: "e9", type: "model.updated", data: {} });
+    await settle();
+    expect(emitted.length).toBeGreaterThan(0);
+    const later = await summary();
+    expect(later.totalMicros).toBe(100_000 + 2_500_000);
+    expect(later.complete).toBe(true);
+  });
+
+  test("A hanging catalog never stalls the summary", async () => {
+    const seed = new Store({ dbPath });
+    seed.completeBackfill([
+      seedRow("m1", {
+        tokens: { input: 0, cacheRead: 0, cacheWrite: 1_000_000 },
+      }),
+    ]);
+    seed.close();
+    const { ctx, summary } = fakeContext({ hangCatalog: true });
+    await start(ctx);
+    const started = Date.now();
+    const reply = await summary();
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(reply).toMatchObject({ totalMicros: 100_000, complete: false });
+  });
+
+  test("An unpriced model marks the summary incomplete and requests a reload", async () => {
+    const seed = new Store({ dbPath });
+    seed.completeBackfill([
+      seedRow("m1", { tokens: { input: 0, cacheRead: 0, cacheWrite: 5 } }),
+    ]);
+    seed.close();
+    const { ctx, summary, listCalls } = fakeContext({ catalog: [] });
+    await start(ctx);
+    await settle();
+    const before = listCalls();
+    expect((await summary()).complete).toBe(false);
+    await settle();
+    expect(listCalls()).toBe(before + 1);
+  });
+
+  test("Change notifications are debounced", async () => {
+    queue = [...step("a", TOKENS), ...step("b", TOKENS), ...step("c", TOKENS)];
+    const { ctx, emitted } = fakeContext();
+    await start(ctx);
     await settle();
     expect(emitted).toHaveLength(1);
-    const store = new Store({ dbPath });
-    expect(store.summary(0, Date.now() + DAY_MS).totalMicros).toBe(
-      100_000 + 2_500_000,
-    );
-    store.close();
   });
 
-  test("Empty catalog records zero and later recovers", async () => {
-    const sourceDbPath = join(dir, "opencode.db");
-    createSource(sourceDbPath);
-    const seed = new Store({ dbPath });
-    seed.completeBackfill([]);
-    seed.close();
-    queue = [
-      {
-        id: "e1",
-        type: "session.step.started",
-        data: {
-          sessionID: "ses_c",
-          assistantMessageID: "m1",
-          agent: "build",
-          model: MODEL,
-          started: Date.now(),
-        },
-      },
-      {
-        id: "e2",
-        type: "session.step.ended",
-        data: {
-          sessionID: "ses_c",
-          assistantMessageID: "m1",
-          cost: 0.1,
-          tokens: WRITE_TOKENS,
-        },
-      },
-    ];
-    const { ctx, setCatalog, push } = fakeContext({ sourceDbPath });
+  test("A late catalog change after dispose does not notify", async () => {
+    const { ctx, emitted, openGate } = fakeContext({
+      catalog: [SONNET_ENTRY],
+      gatedCatalog: true,
+    });
     await start(ctx);
+    await cleanup?.();
+    cleanup = undefined;
+    openGate();
     await settle();
-    const early = new Store({ dbPath });
-    expect(early.summary(0, Date.now() + DAY_MS).totalMicros).toBe(100_000);
-    early.close();
-    setCatalog([SONNET_ENTRY]);
-    push({ id: "e9", type: "model.updated", data: {} });
-    await settle();
-    const later = new Store({ dbPath });
-    expect(later.summary(0, Date.now() + DAY_MS).totalMicros).toBe(
-      100_000 + 2_500_000,
-    );
-    later.close();
+    expect(emitted).toHaveLength(0);
   });
 });

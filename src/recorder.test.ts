@@ -1,8 +1,7 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-recording/spec.md
-// spec: openspec/changes/account-for-cache-writes/specs/cost-recording/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
 import { describe, expect, test } from "bun:test";
 import { createRecorder, type CostEvent } from "./recorder";
-import { parseCatalog, type PriceTable } from "./pricing";
 
 const TOKENS = {
   input: 1,
@@ -12,28 +11,16 @@ const TOKENS = {
 };
 const MODEL = { providerID: "github-copilot", id: "claude-sonnet-4.6" };
 
-const CATALOG = parseCatalog([
-  {
-    id: "claude-sonnet-4.6",
-    providerID: "github-copilot",
-    family: "claude-sonnet",
-    cost: [{ input: 2, output: 10, cache: { read: 0.2, write: 0 } }],
-  },
-]);
 const WRITE_TOKENS = {
-  input: 1,
+  input: 4,
   output: 1,
   reasoning: 0,
-  cache: { read: 0, write: 1_000_000 },
+  cache: { read: 5, write: 1_000_000 },
 };
 
-function recorder(
-  parents: Record<string, string | null> = {},
-  table: PriceTable = CATALOG,
-) {
+function recorder(parents: Record<string, string | null> = {}) {
   return createRecorder({
     resolveParent: async (sessionID) => parents[sessionID] ?? null,
-    prices: async () => table,
     now: () => 9_999,
   });
 }
@@ -72,7 +59,7 @@ describe("recorder", () => {
       kind: "step",
       failed: false,
       costMicros: 12_300,
-      cacheWriteExtraMicros: 0,
+      tokens: { input: 1, cacheRead: 0, cacheWrite: 0 },
       createdAt: 5_000,
     });
   });
@@ -190,7 +177,6 @@ describe("recorder", () => {
       resolveParent: async () => {
         throw new Error("boom");
       },
-      prices: async () => CATALOG,
       now: () => 1,
     });
     expect(await r.handle(ended("ses_1", "m", 0.01))).toMatchObject({
@@ -198,87 +184,54 @@ describe("recorder", () => {
     });
   });
 
-  describe("cache-write add-on", () => {
-    const endedWithWrites = (
+  describe("token storage", () => {
+    const endedWith = (
       id: string,
-      type = "session.step.ended",
+      type: string,
+      tokens: unknown,
     ): CostEvent => ({
       id: `evt_${id}`,
       type,
-      data: {
-        sessionID: "ses_1",
-        assistantMessageID: id,
-        cost: 0.01,
-        tokens: WRITE_TOKENS,
-      },
+      data: { sessionID: "ses_1", assistantMessageID: id, cost: 0.01, tokens },
     });
 
-    test("Sonnet cache writes are priced", async () => {
-      const r = recorder();
-      await r.handle(started("ses_1", "m1", "build"));
-      expect(await r.handle(endedWithWrites("m1"))).toMatchObject({
-        costMicros: 10_000,
-        cacheWriteExtraMicros: 2_500_000,
-      });
-    });
-
-    test("Failed steps get the add-on", async () => {
+    test("Step tokens are stored", async () => {
       const r = recorder();
       await r.handle(started("ses_1", "m1", "build"));
       expect(
-        await r.handle(endedWithWrites("m1", "session.step.failed")),
+        await r.handle(endedWith("m1", "session.step.ended", WRITE_TOKENS)),
       ).toMatchObject({
-        failed: true,
-        cacheWriteExtraMicros: 2_500_000,
+        costMicros: 10_000,
+        tokens: { input: 4, cacheRead: 5, cacheWrite: 1_000_000 },
       });
     });
 
-    test("a compaction gets the add-on from the event model", async () => {
+    test("failed steps store tokens too", async () => {
       const r = recorder();
-      await r.handle(started("ses_1", "m0", "build"));
+      expect(
+        await r.handle(endedWith("m1", "session.step.failed", WRITE_TOKENS)),
+      ).toMatchObject({
+        failed: true,
+        tokens: { cacheWrite: 1_000_000 },
+      });
+    });
+
+    test("Compaction without tokens stores NULL", async () => {
+      const r = recorder();
       const result = await r.handle({
         id: "evt_c",
         type: "session.compaction.ended",
-        data: {
-          sessionID: "ses_1",
-          model: MODEL,
-          cost: 0.1,
-          tokens: WRITE_TOKENS,
-        },
+        data: { sessionID: "ses_1", model: MODEL, cost: 0.1 },
       });
-      expect(result).toMatchObject({
-        kind: "compaction",
-        cacheWriteExtraMicros: 2_500_000,
-      });
+      expect(result).toMatchObject({ kind: "compaction", tokens: null });
     });
 
-    test("No add-on outside the rule", async () => {
-      const unknownAttribution = recorder();
+    test("A malformed token object stores zeros", async () => {
+      const r = recorder();
       expect(
-        await unknownAttribution.handle(endedWithWrites("m1")),
+        await r.handle(endedWith("m1", "session.step.ended", { input: 3 })),
       ).toMatchObject({
-        agent: "unknown",
-        cacheWriteExtraMicros: 0,
-      });
-      const noCatalog = recorder({}, new Map());
-      await noCatalog.handle(started("ses_1", "m2", "build"));
-      expect(await noCatalog.handle(endedWithWrites("m2"))).toMatchObject({
-        cacheWriteExtraMicros: 0,
-      });
-    });
-
-    test("a failing price lookup still records the row", async () => {
-      const r = createRecorder({
-        resolveParent: async () => null,
-        prices: async () => {
-          throw new Error("down");
-        },
-        now: () => 1,
-      });
-      await r.handle(started("ses_1", "m1", "build"));
-      expect(await r.handle(endedWithWrites("m1"))).toMatchObject({
-        costMicros: 10_000,
-        cacheWriteExtraMicros: 0,
+        tokens: { input: 3, cacheRead: 0, cacheWrite: 0 },
       });
     });
   });

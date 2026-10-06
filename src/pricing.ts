@@ -1,6 +1,7 @@
 /** GitHub bills Claude cache writes at 1.25x the input price (5-minute cache, verified against the Copilot usage table). */
 export const CACHE_WRITE_MULTIPLIER = 1.25;
-const COPILOT_PROVIDER = "github-copilot";
+/** The only provider whose Claude cache writes are billed but priced at 0 by opencode. */
+export const COPILOT_PROVIDER = "github-copilot";
 const CLAUDE_FAMILY_PREFIX = "claude";
 const CLAUDE_ID_PREFIX = "claude-";
 
@@ -57,6 +58,21 @@ function isCopilotClaude(price: ModelPrice): boolean {
   return price.family !== undefined
     ? price.family.toLowerCase().startsWith(CLAUDE_FAMILY_PREFIX)
     : price.modelId.startsWith(CLAUDE_ID_PREFIX);
+}
+
+/**
+ * Whether a row of this model can carry a cache-write cost. With a catalog entry the Claude test
+ * uses the entry's family; without one it falls back to the `claude-` id prefix.
+ */
+export function addOnApplies(
+  providerId: string,
+  modelId: string,
+  price: ModelPrice | undefined,
+): boolean {
+  if (price) return isCopilotClaude(price);
+  return (
+    providerId === COPILOT_PROVIDER && modelId.startsWith(CLAUDE_ID_PREFIX)
+  );
 }
 
 /** Mirrors opencode's `calculateCost`: largest context tier below the context size, else the untiered entry. */
@@ -135,27 +151,20 @@ export function parseCatalog(response: unknown): PriceTable {
   return table;
 }
 
-/**
- * True when the catalog carries a priced Copilot Claude model. A partly loaded catalog can hold
- * other Copilot models first, so anything weaker would let the one-time correction run too early.
- */
-export function hasCopilotClaudePrices(table: PriceTable): boolean {
-  for (const price of table.values()) {
-    if (isCopilotClaude(price) && price.cost.length > 0) return true;
-  }
-  return false;
-}
-
 export interface PriceLookup {
-  /** The cached table; loads when empty or invalidated. Concurrent calls share one load. */
-  current(): Promise<PriceTable>;
-  /** Marks the cache stale so the next `current()` reloads. */
-  invalidate(): void;
+  /** The cached catalog snapshot; synchronous, never loads, empty until the first load lands. */
+  table(): PriceTable;
+  /**
+   * Fire-and-forget reload, one load at a time. `"updated"` always loads (queued once if a load is
+   * running); `"miss"` loads at most once per `MISS_RELOAD_INTERVAL_MS`.
+   */
+  refresh(reason: "updated" | "miss"): void;
 }
 
 const EMPTY: PriceTable = new Map();
-/** A hung catalog call must not stall startup or recording; recording with add-on 0 is the soft failure. */
+/** A hung catalog call must not stall anything for long; the summary never waits for it anyway. */
 const LOAD_TIMEOUT_MS = 5_000;
+const MISS_RELOAD_INTERVAL_MS = 60_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -165,40 +174,58 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+function fingerprint(table: PriceTable): string {
+  return JSON.stringify([...table].sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+/**
+ * Keeps the last non-empty catalog. `onChange` fires only when a load produced a different table,
+ * so a model that stays unpriced cannot cause a notify -> summary -> reload loop.
+ */
 export function createPriceLookup(
   list: () => Promise<unknown>,
   log: (message: string) => void,
+  onChange: () => void,
+  now: () => number = Date.now,
 ): PriceLookup {
   let table: PriceTable = EMPTY;
-  let stale = true;
-  let inFlight: Promise<PriceTable> | undefined;
+  let loading = false;
+  let queued = false;
+  let lastMissStart = Number.NEGATIVE_INFINITY;
   let failing = false;
 
-  async function load(): Promise<PriceTable> {
+  async function load(): Promise<void> {
+    loading = true;
     try {
       const loaded = parseCatalog(await withTimeout(list(), LOAD_TIMEOUT_MS));
       failing = false;
-      if (loaded.size > 0) {
+      if (loaded.size > 0 && fingerprint(loaded) !== fingerprint(table)) {
         table = loaded;
-        stale = false;
+        onChange();
       }
     } catch (error) {
       if (!failing) log(`failed to load model prices: ${String(error)}`);
       failing = true;
+    } finally {
+      loading = false;
+      if (queued) {
+        queued = false;
+        void load();
+      }
     }
-    return table;
   }
 
   return {
-    async current() {
-      if (!stale && table.size > 0) return table;
-      inFlight ??= load().finally(() => {
-        inFlight = undefined;
-      });
-      return inFlight;
-    },
-    invalidate() {
-      stale = true;
+    table: () => table,
+    refresh(reason) {
+      if (reason === "miss") {
+        if (loading || now() - lastMissStart < MISS_RELOAD_INTERVAL_MS) return;
+        lastMissStart = now();
+      } else if (loading) {
+        queued = true;
+        return;
+      }
+      void load();
     },
   };
 }

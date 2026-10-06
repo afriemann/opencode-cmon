@@ -2,7 +2,8 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { AgentTotal, CostRow, ModelTotal, Summary } from "./types";
+import { COPILOT_PROVIDER, type TokenCounts } from "./pricing";
+import type { AgentTotal, Candidate, CostRow, ModelTotal } from "./types";
 
 export interface StoreOptions {
   dbPath?: string;
@@ -10,12 +11,15 @@ export interface StoreOptions {
 }
 
 /** Bumped whenever the on-disk schema changes. */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
+const TOKEN_COLUMNS = [
+  "tokens_input",
+  "tokens_cache_read",
+  "tokens_cache_write",
+] as const;
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const BACKFILL_MARKER = "backfill_done";
-/** Versioned: bump it when the correction's preconditions change so existing databases rerun it. */
-const CORRECTION_MARKER = "cache_write_correction_v3_done";
 
 export function opencodeDataDir(
   env: Record<string, string | undefined> = process.env,
@@ -31,6 +35,8 @@ export function resolveDbPath(
   return options.dbPath ?? join(opencodeDataDir(), "cmon.db");
 }
 
+// `cache_write_extra_micros` is unused since pricing moved to read time. It stays because dropping
+// a column would break older plugin processes that are still running and need SQLite >= 3.35.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cost_entry (
   id TEXT PRIMARY KEY,
@@ -43,6 +49,9 @@ CREATE TABLE IF NOT EXISTS cost_entry (
   failed INTEGER NOT NULL DEFAULT 0,
   cost_micros INTEGER NOT NULL,
   cache_write_extra_micros INTEGER NOT NULL DEFAULT 0,
+  tokens_input INTEGER,
+  tokens_cache_read INTEGER,
+  tokens_cache_write INTEGER,
   created_at INTEGER NOT NULL,
   source TEXT NOT NULL CHECK (source IN ('live','backfill'))
 );
@@ -50,8 +59,8 @@ CREATE INDEX IF NOT EXISTS cost_entry_created_at ON cost_entry(created_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `;
 
-const INSERT_COLUMNS = `(id, session_id, parent_session_id, agent, provider_id, model_id, kind, failed, cost_micros, cache_write_extra_micros, created_at, source)
-VALUES ($id, $sessionId, $parentSessionId, $agent, $providerId, $modelId, $kind, $failed, $costMicros, $cacheWriteExtraMicros, $createdAt, $source)`;
+const INSERT_COLUMNS = `(id, session_id, parent_session_id, agent, provider_id, model_id, kind, failed, cost_micros, tokens_input, tokens_cache_read, tokens_cache_write, created_at, source)
+VALUES ($id, $sessionId, $parentSessionId, $agent, $providerId, $modelId, $kind, $failed, $costMicros, $tokensInput, $tokensCacheRead, $tokensCacheWrite, $createdAt, $source)`;
 
 function bindings(row: CostRow, source: "live" | "backfill") {
   return {
@@ -64,7 +73,9 @@ function bindings(row: CostRow, source: "live" | "backfill") {
     $kind: row.kind,
     $failed: row.failed ? 1 : 0,
     $costMicros: row.costMicros,
-    $cacheWriteExtraMicros: row.cacheWriteExtraMicros,
+    $tokensInput: row.tokens?.input ?? null,
+    $tokensCacheRead: row.tokens?.cacheRead ?? null,
+    $tokensCacheWrite: row.tokens?.cacheWrite ?? null,
     $createdAt: row.createdAt,
     $source: source,
   };
@@ -113,10 +124,19 @@ export class Store {
           );
         }
         if (version === 0) this.db.exec(SCHEMA);
-        if (version === 1) {
-          this.db.exec(
-            "ALTER TABLE cost_entry ADD COLUMN cache_write_extra_micros INTEGER NOT NULL DEFAULT 0",
-          );
+        else {
+          if (version < 2) {
+            this.db.exec(
+              "ALTER TABLE cost_entry ADD COLUMN cache_write_extra_micros INTEGER NOT NULL DEFAULT 0",
+            );
+          }
+          if (version < 3) {
+            for (const column of TOKEN_COLUMNS) {
+              this.db.exec(
+                `ALTER TABLE cost_entry ADD COLUMN ${column} INTEGER`,
+              );
+            }
+          }
         }
         this.db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
       })
@@ -140,8 +160,9 @@ export class Store {
            session_id = excluded.session_id, parent_session_id = excluded.parent_session_id,
            agent = excluded.agent, provider_id = excluded.provider_id, model_id = excluded.model_id,
            kind = excluded.kind, failed = excluded.failed, cost_micros = excluded.cost_micros,
-           cache_write_extra_micros = CASE WHEN excluded.cache_write_extra_micros > 0
-             THEN excluded.cache_write_extra_micros ELSE cost_entry.cache_write_extra_micros END,
+           tokens_input = COALESCE(excluded.tokens_input, cost_entry.tokens_input),
+           tokens_cache_read = COALESCE(excluded.tokens_cache_read, cost_entry.tokens_cache_read),
+           tokens_cache_write = COALESCE(excluded.tokens_cache_write, cost_entry.tokens_cache_write),
            created_at = excluded.created_at, source = excluded.source
          WHERE cost_entry.source = 'backfill' OR cost_entry.agent = 'unknown'`,
       )
@@ -172,29 +193,38 @@ export class Store {
     return imported;
   }
 
-  isCorrectionDone(): boolean {
-    return this.getMeta(CORRECTION_MARKER) !== undefined;
+  /** Ids of rows in the retention window whose token counts are unknown. */
+  idsMissingTokens(since: number): string[] {
+    return (
+      this.db
+        .query(
+          "SELECT id FROM cost_entry WHERE tokens_cache_write IS NULL AND created_at >= $since ORDER BY id",
+        )
+        .all({ $since: since }) as Array<{ id: string }>
+    ).map((entry) => entry.id);
   }
 
   /**
-   * Sets the add-on of existing rows that still have none in one write transaction. The marker is
-   * set only when `complete`, and re-checked under the lock so concurrent processes finish once;
-   * returns how many rows changed. `complete` is required so a premature marker cannot be set by
-   * omission.
+   * Sets token counts on rows that still have none, in one short write transaction, so concurrent
+   * fills apply once. Returns how many rows changed.
    */
-  applyCacheWriteCorrection(
-    updates: ReadonlyArray<{ id: string; micros: number }>,
-    complete: boolean,
+  fillTokens(
+    updates: ReadonlyArray<{ id: string; tokens: TokenCounts }>,
   ): number {
     const update = this.db.query(
-      "UPDATE cost_entry SET cache_write_extra_micros = $micros WHERE id = $id AND cache_write_extra_micros = 0",
+      `UPDATE cost_entry SET tokens_input = $input, tokens_cache_read = $read, tokens_cache_write = $write
+       WHERE id = $id AND tokens_cache_write IS NULL`,
     );
     const apply = this.db.transaction((): number => {
-      if (this.isCorrectionDone()) return 0;
       let changed = 0;
-      for (const { id, micros } of updates)
-        changed += update.run({ $id: id, $micros: micros }).changes;
-      if (complete) this.setMeta(CORRECTION_MARKER, String(Date.now()));
+      for (const { id, tokens } of updates) {
+        changed += update.run({
+          $id: id,
+          $input: tokens.input,
+          $read: tokens.cacheRead,
+          $write: tokens.cacheWrite,
+        }).changes;
+      }
       return changed;
     });
     const changed = apply.immediate();
@@ -210,24 +240,65 @@ export class Store {
   ): T[] {
     return this.db
       .query(
-        `SELECT ${column} AS ${alias}, SUM(cost_micros + cache_write_extra_micros) AS micros FROM cost_entry
-         WHERE created_at >= $from AND created_at < $to
-         GROUP BY ${alias} ORDER BY micros DESC, ${alias} ASC`,
+        `SELECT ${column} AS ${alias}, SUM(cost_micros) AS micros FROM cost_entry
+         WHERE created_at >= $from AND created_at < $to GROUP BY ${alias}`,
       )
       .all({ $from: from, $to: to }) as T[];
   }
 
-  /** Total, per-agent and per-`provider/model` sums over `[from, to)`, largest first then by name. */
-  summary(from: number, to: number): Summary {
-    const agents = this.totalsBy<AgentTotal>("agent", "agent", from, to);
-    const models = this.totalsBy<ModelTotal>(
-      "provider_id || '/' || model_id",
-      "model",
-      from,
-      to,
-    );
-    const totalMicros = agents.reduce((sum, entry) => sum + entry.micros, 0);
-    return { revision: this.revisionCounter, totalMicros, agents, models };
+  /**
+   * Per-agent and per-`provider/model` sums of opencode's own cost over `[from, to)` plus the rows
+   * that may carry a cache-write cost, read in one snapshot so they agree. Ordering and the add-on
+   * are applied in code (`buildSummary`).
+   */
+  summaryInputs(
+    from: number,
+    to: number,
+  ): {
+    revision: number;
+    agents: AgentTotal[];
+    models: ModelTotal[];
+    candidates: Candidate[];
+  } {
+    const read = this.db.transaction(() => {
+      const agents = this.totalsBy<AgentTotal>("agent", "agent", from, to);
+      const models = this.totalsBy<ModelTotal>(
+        "provider_id || '/' || model_id",
+        "model",
+        from,
+        to,
+      );
+      const rows = this.db
+        .query(
+          `SELECT agent, provider_id, model_id, tokens_input, tokens_cache_read, tokens_cache_write
+           FROM cost_entry WHERE created_at >= $from AND created_at < $to
+             AND provider_id = $provider
+             AND (tokens_cache_write > 0 OR tokens_cache_write IS NULL)`,
+        )
+        .all({ $from: from, $to: to, $provider: COPILOT_PROVIDER }) as Array<{
+        agent: string;
+        provider_id: string;
+        model_id: string;
+        tokens_input: number | null;
+        tokens_cache_read: number | null;
+        tokens_cache_write: number | null;
+      }>;
+      const candidates = rows.map((row): Candidate => ({
+        agent: row.agent,
+        providerId: row.provider_id,
+        modelId: row.model_id,
+        tokens:
+          row.tokens_cache_write === null
+            ? null
+            : {
+                input: row.tokens_input ?? 0,
+                cacheRead: row.tokens_cache_read ?? 0,
+                cacheWrite: row.tokens_cache_write,
+              },
+      }));
+      return { agents, models, candidates };
+    });
+    return { revision: this.revisionCounter, ...read.deferred() };
   }
 
   /** Deletes rows older than `cutoff`; returns how many were removed. */

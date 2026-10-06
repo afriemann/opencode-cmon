@@ -1,10 +1,5 @@
 import { usdToMicros } from "./money";
-import {
-  cacheWriteExtraMicros,
-  priceKey,
-  tokenCounts,
-  type PriceTable,
-} from "./pricing";
+import { tokenCounts } from "./pricing";
 import { COMPACTION_AGENT, UNKNOWN, type CostRow } from "./types";
 
 export interface CostEvent {
@@ -16,8 +11,6 @@ export interface CostEvent {
 export interface RecorderDeps {
   /** Returns the parent session ID, or null for a top-level session. */
   readonly resolveParent: (sessionID: string) => Promise<string | null>;
-  /** Current model prices; an empty table means no add-on can be computed yet. */
-  readonly prices: () => Promise<PriceTable>;
   readonly now: () => number;
 }
 
@@ -76,22 +69,6 @@ export function createRecorder(deps: RecorderDeps): Recorder {
     }
   }
 
-  async function addOn(
-    providerId: string,
-    modelId: string,
-    tokens: unknown,
-  ): Promise<number> {
-    try {
-      const table = await deps.prices();
-      return cacheWriteExtraMicros(
-        tokenCounts(tokens),
-        table.get(priceKey(providerId, modelId)),
-      );
-    } catch {
-      return 0;
-    }
-  }
-
   async function stepRow(
     data: Readonly<Record<string, unknown>>,
     failed: boolean,
@@ -114,11 +91,7 @@ export function createRecorder(deps: RecorderDeps): Recorder {
       kind: "step",
       failed,
       costMicros: usdToMicros(cost),
-      cacheWriteExtraMicros: await addOn(
-        state?.providerId ?? UNKNOWN,
-        state?.modelId ?? UNKNOWN,
-        data.tokens,
-      ),
+      tokens: tokenCounts(data.tokens),
       createdAt: own?.started ?? deps.now(),
     };
   }
@@ -150,11 +123,8 @@ export function createRecorder(deps: RecorderDeps): Recorder {
       kind: "compaction",
       failed,
       costMicros: usdToMicros(cost),
-      cacheWriteExtraMicros: await addOn(
-        model?.providerId ?? UNKNOWN,
-        model?.modelId ?? UNKNOWN,
-        data.tokens,
-      ),
+      // Null means unknown: the startup fill (or a redelivery) resolves it.
+      tokens: data.tokens == null ? null : tokenCounts(data.tokens),
       createdAt: deps.now(),
     };
   }

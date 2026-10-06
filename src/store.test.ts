@@ -1,10 +1,10 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-recording/spec.md
-// spec: openspec/changes/account-for-cache-writes/specs/cost-recording/spec.md
-// spec: openspec/changes/account-for-cache-writes/specs/cost-retention/spec.md
-// spec: openspec/changes/account-for-cache-writes/specs/cost-display/spec.md
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-display/spec.md
 // spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -34,10 +34,17 @@ function row(overrides: Partial<CostRow> = {}): CostRow {
     kind: "step",
     failed: false,
     costMicros: 100_000,
-    cacheWriteExtraMicros: 0,
+    tokens: { input: 1, cacheRead: 2, cacheWrite: 3 },
     createdAt: 1_000,
     ...overrides,
   };
+}
+
+/** Total cost over a range from the SQL aggregates (add-on excluded). */
+function total(store: Store, from = 0, to = 10_000): number {
+  return store
+    .summaryInputs(from, to)
+    .agents.reduce((sum, a) => sum + a.micros, 0);
 }
 
 beforeEach(() => {
@@ -55,7 +62,7 @@ describe("store", () => {
     const store = open();
     store.upsertLive(row());
     store.upsertLive(row());
-    expect(store.summary(0, 10_000).totalMicros).toBe(100_000);
+    expect(total(store)).toBe(100_000);
   });
 
   test("a redelivered ended event without its start does not clobber a good live row", () => {
@@ -73,7 +80,7 @@ describe("store", () => {
     const b = open();
     a.upsertLive(row());
     b.upsertLive(row());
-    expect(a.summary(0, 10_000).totalMicros).toBe(100_000);
+    expect(total(a)).toBe(100_000);
   });
 
   test("Sub-agent cost is attributed to the sub-agent", () => {
@@ -98,7 +105,7 @@ describe("store", () => {
     const store = open();
     store.upsertLive(row({ id: "a", createdAt: 100, costMicros: 1 }));
     store.upsertLive(row({ id: "b", createdAt: 200, costMicros: 10 }));
-    expect(store.summary(100, 200).totalMicros).toBe(1);
+    expect(total(store, 100, 200)).toBe(1);
   });
 
   test("summary groups per agent, largest first then by name", () => {
@@ -107,14 +114,16 @@ describe("store", () => {
     store.upsertLive(row({ id: "b", agent: "alpha", costMicros: 5 }));
     store.upsertLive(row({ id: "c", agent: "build", costMicros: 50 }));
     store.upsertLive(row({ id: "d", agent: "build", costMicros: 50 }));
-    expect(store.summary(0, 10_000)).toMatchObject({
-      totalMicros: 110,
-      agents: [
-        { agent: "build", micros: 100 },
-        { agent: "alpha", micros: 5 },
-        { agent: "zeta", micros: 5 },
-      ],
-    });
+    const { agents } = store.summaryInputs(0, 10_000);
+    expect(
+      agents
+        .slice()
+        .sort((a, b) => b.micros - a.micros || a.agent.localeCompare(b.agent)),
+    ).toEqual([
+      { agent: "build", micros: 100 },
+      { agent: "alpha", micros: 5 },
+      { agent: "zeta", micros: 5 },
+    ]);
   });
 
   test("Models are grouped by provider and model", () => {
@@ -124,28 +133,19 @@ describe("store", () => {
       providerId: string,
       modelId: string,
       costMicros: number,
-      extra = 0,
-    ) =>
-      row({
-        id,
-        providerId,
-        modelId,
-        costMicros,
-        cacheWriteExtraMicros: extra,
-      });
+    ) => row({ id, providerId, modelId, costMicros });
     store.upsertLive(m("a", "p", "m1", 10));
-    store.upsertLive(m("b", "p", "m1", 10, 5));
+    store.upsertLive(m("b", "p", "m1", 15));
     store.upsertLive(m("c", "p", "m2", 25));
     store.upsertLive(m("d", "q", "m1", 25));
-    const summary = store.summary(0, 10_000);
-    expect(summary.models).toEqual([
+    const { models } = store.summaryInputs(0, 10_000);
+    expect(
+      models.slice().sort((x, y) => x.model.localeCompare(y.model)),
+    ).toEqual([
       { model: "p/m1", micros: 25 },
       { model: "p/m2", micros: 25 },
       { model: "q/m1", micros: 25 },
     ]);
-    expect(summary.models.reduce((sum, e) => sum + e.micros, 0)).toBe(
-      summary.totalMicros,
-    );
   });
 
   test("Old rows are removed at startup", () => {
@@ -153,21 +153,21 @@ describe("store", () => {
     store.upsertLive(row({ id: "old", createdAt: 10 }));
     store.upsertLive(row({ id: "new", createdAt: 1_000 }));
     expect(store.prune(500)).toBe(1);
-    expect(store.summary(0, 10_000).totalMicros).toBe(100_000);
+    expect(total(store)).toBe(100_000);
   });
 
   test("Live data wins over backfilled data", () => {
     const store = open();
     store.completeBackfill([row({ costMicros: 1 })]);
     store.upsertLive(row({ costMicros: 2 }));
-    expect(store.summary(0, 10_000).totalMicros).toBe(2);
+    expect(total(store)).toBe(2);
   });
 
   test("backfill never overwrites an existing live row", () => {
     const store = open();
     store.upsertLive(row({ costMicros: 2 }));
     store.completeBackfill([row({ costMicros: 1 })]);
-    expect(store.summary(0, 10_000).totalMicros).toBe(2);
+    expect(total(store)).toBe(2);
   });
 
   test("Simultaneous starts import once", () => {
@@ -176,50 +176,120 @@ describe("store", () => {
     const rows = [row({ id: "x" }), row({ id: "y" })];
     expect(a.completeBackfill(rows)).toBe(true);
     expect(b.completeBackfill(rows)).toBe(false);
-    expect(a.summary(0, 10_000).totalMicros).toBe(200_000);
+    expect(total(a)).toBe(200_000);
     expect(b.isBackfillDone()).toBe(true);
   });
 
-  test("Summary shows the corrected figure", () => {
-    const store = open();
-    store.upsertLive(
-      row({ costMicros: 100_000, cacheWriteExtraMicros: 50_000 }),
-    );
-    expect(store.summary(0, 10_000)).toMatchObject({
-      totalMicros: 150_000,
-      agents: [{ agent: "build", micros: 150_000 }],
+  describe("tokens", () => {
+    const stored = (id = "msg_1") =>
+      new Database(dbPath, { readonly: true })
+        .query(
+          "SELECT tokens_input i, tokens_cache_read r, tokens_cache_write w FROM cost_entry WHERE id = $id",
+        )
+        .get({ $id: id });
+
+    test("Step tokens are stored", () => {
+      open().upsertLive(row());
+      expect(stored()).toEqual({ i: 1, r: 2, w: 3 });
+    });
+
+    test("Compaction without tokens stores NULL", () => {
+      open().upsertLive(row({ tokens: null }));
+      expect(stored()).toEqual({ i: null, r: null, w: null });
+    });
+
+    test("A redelivery keeps stored tokens", () => {
+      const store = open();
+      store.upsertLive(row({ agent: "unknown" }));
+      store.upsertLive(row({ agent: "build", tokens: null }));
+      expect(stored()).toEqual({ i: 1, r: 2, w: 3 });
+    });
+
+    test("Backfill stores tokens", () => {
+      open().completeBackfill([
+        row({ tokens: { input: 7, cacheRead: 8, cacheWrite: 9 } }),
+      ]);
+      expect(stored()).toEqual({ i: 7, r: 8, w: 9 });
+    });
+
+    test("candidates are Copilot rows in range with cache writes or unknown tokens", () => {
+      const store = open();
+      store.upsertLive(
+        row({ id: "a", tokens: { input: 1, cacheRead: 1, cacheWrite: 0 } }),
+      );
+      store.upsertLive(row({ id: "b" }));
+      store.upsertLive(row({ id: "c", tokens: null }));
+      store.upsertLive(row({ id: "d", providerId: "openrouter" }));
+      store.upsertLive(row({ id: "e", createdAt: 99_999 }));
+      const { candidates } = store.summaryInputs(0, 10_000);
+      expect(candidates.map((c) => c.modelId)).toHaveLength(2);
+      expect(candidates.some((c) => c.tokens === null)).toBe(true);
+      expect(candidates.some((c) => c.tokens?.cacheWrite === 3)).toBe(true);
     });
   });
 
-  test("A redelivery with zero add-on keeps the stored add-on", () => {
-    const store = open();
-    store.upsertLive(row({ agent: "unknown", cacheWriteExtraMicros: 7 }));
-    store.upsertLive(row({ agent: "build", cacheWriteExtraMicros: 0 }));
-    expect(store.summary(0, 10_000).totalMicros).toBe(100_007);
-  });
+  describe("token fill", () => {
+    test("idsMissingTokens lists NULL-token rows since a cutoff", () => {
+      const store = open();
+      store.upsertLive(row({ id: "a", tokens: null, createdAt: 50 }));
+      store.upsertLive(row({ id: "b", tokens: null, createdAt: 500 }));
+      store.upsertLive(row({ id: "c" }));
+      expect(store.idsMissingTokens(100)).toEqual(["b"]);
+    });
 
-  test("backfill stores the add-on", () => {
-    const store = open();
-    store.completeBackfill([row({ cacheWriteExtraMicros: 11 })]);
-    expect(store.summary(0, 10_000).totalMicros).toBe(100_011);
+    test("Fill sets tokens only where still NULL and bumps the revision", () => {
+      const store = open();
+      store.upsertLive(row({ id: "a", tokens: null }));
+      store.upsertLive(row({ id: "b" }));
+      const before = store.revision();
+      const changed = store.fillTokens([
+        { id: "a", tokens: { input: 4, cacheRead: 5, cacheWrite: 6 } },
+        { id: "b", tokens: { input: 9, cacheRead: 9, cacheWrite: 9 } },
+      ]);
+      expect(changed).toBe(1);
+      expect(store.revision()).toBeGreaterThan(before);
+      expect(store.idsMissingTokens(0)).toEqual([]);
+      expect(
+        store.fillTokens([
+          { id: "a", tokens: { input: 0, cacheRead: 0, cacheWrite: 0 } },
+        ]),
+      ).toBe(0);
+    });
+
+    test("Concurrent fills apply once", () => {
+      const a = open();
+      const b = open();
+      a.upsertLive(row({ id: "a", tokens: null }));
+      const update = [
+        { id: "a", tokens: { input: 1, cacheRead: 1, cacheWrite: 1 } },
+      ];
+      expect([a.fillTokens(update), b.fillTokens(update)]).toEqual([1, 0]);
+    });
   });
 
   describe("schema upgrade", () => {
-    function createV1(): void {
+    const V1 = `
+      CREATE TABLE cost_entry (
+        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, parent_session_id TEXT, agent TEXT NOT NULL,
+        provider_id TEXT NOT NULL, model_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('step','compaction')), failed INTEGER NOT NULL DEFAULT 0,
+        cost_micros INTEGER NOT NULL, created_at INTEGER NOT NULL,
+        source TEXT NOT NULL CHECK (source IN ('live','backfill'))
+      );
+      CREATE INDEX cost_entry_created_at ON cost_entry(created_at);
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO cost_entry VALUES ('old','s',NULL,'build','p','m','step',0,5,100,'live');
+    `;
+
+    function createOld(version: 1 | 2): void {
       const raw = new Database(dbPath, { create: true });
-      raw.exec(`
-        CREATE TABLE cost_entry (
-          id TEXT PRIMARY KEY, session_id TEXT NOT NULL, parent_session_id TEXT, agent TEXT NOT NULL,
-          provider_id TEXT NOT NULL, model_id TEXT NOT NULL,
-          kind TEXT NOT NULL CHECK (kind IN ('step','compaction')), failed INTEGER NOT NULL DEFAULT 0,
-          cost_micros INTEGER NOT NULL, created_at INTEGER NOT NULL,
-          source TEXT NOT NULL CHECK (source IN ('live','backfill'))
+      raw.exec(V1);
+      if (version === 2) {
+        raw.exec(
+          "ALTER TABLE cost_entry ADD COLUMN cache_write_extra_micros INTEGER NOT NULL DEFAULT 0",
         );
-        CREATE INDEX cost_entry_created_at ON cost_entry(created_at);
-        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        INSERT INTO cost_entry VALUES ('old','s',NULL,'build','p','m','step',0,5,100,'live');
-        PRAGMA user_version = 1;
-      `);
+      }
+      raw.exec(`PRAGMA user_version = ${version}`);
       raw.close();
     }
 
@@ -233,102 +303,52 @@ describe("store", () => {
       raw.close();
       return names;
     };
+    const version = (): unknown => {
+      const raw = new Database(dbPath, { readonly: true });
+      const v = raw.query("PRAGMA user_version").get();
+      raw.close();
+      return v;
+    };
 
     test("Version 1 database is upgraded", () => {
-      createV1();
+      createOld(1);
       const store = open();
-      expect(store.summary(0, 1_000).totalMicros).toBe(5);
-      expect(
-        columns().filter((n) => n === "cache_write_extra_micros"),
-      ).toHaveLength(1);
-      const raw = new Database(dbPath, { readonly: true });
-      expect(raw.query("PRAGMA user_version").get()).toEqual({
-        user_version: 2,
-      });
-      raw.close();
+      expect(total(store, 0, 1_000)).toBe(5);
+      expect(store.idsMissingTokens(0)).toEqual(["old"]);
+      expect(version()).toEqual({ user_version: 3 });
+      expect(columns().filter((n) => n === "tokens_cache_write")).toHaveLength(
+        1,
+      );
     });
 
-    test("a fresh database is created at version 2", () => {
-      open();
+    test("Version 2 database is upgraded", () => {
+      createOld(2);
+      const store = open();
+      expect(total(store, 0, 1_000)).toBe(5);
+      expect(store.idsMissingTokens(0)).toEqual(["old"]);
       expect(columns()).toContain("cache_write_extra_micros");
+      expect(version()).toEqual({ user_version: 3 });
+    });
+
+    test("a fresh database is created at version 3", () => {
+      open();
+      expect(columns()).toEqual(
+        expect.arrayContaining([
+          "tokens_input",
+          "tokens_cache_read",
+          "tokens_cache_write",
+        ]),
+      );
+      expect(version()).toEqual({ user_version: 3 });
     });
 
     test("Concurrent upgrades both succeed", () => {
-      createV1();
+      createOld(2);
       const a = open();
       const b = open();
-      expect(a.summary(0, 1_000).totalMicros).toBe(5);
-      expect(b.summary(0, 1_000).totalMicros).toBe(5);
-      expect(
-        columns().filter((n) => n === "cache_write_extra_micros"),
-      ).toHaveLength(1);
-    });
-  });
-
-  describe("cache-write correction", () => {
-    test("Existing rows are corrected", () => {
-      const store = open();
-      store.upsertLive(row({ id: "a" }));
-      store.completeBackfill([row({ id: "b" })]);
-      const before = store.revision();
-      expect(
-        store.applyCacheWriteCorrection(
-          [
-            { id: "a", micros: 10 },
-            { id: "b", micros: 20 },
-          ],
-          true,
-        ),
-      ).toBe(2);
-      expect(store.summary(0, 10_000).totalMicros).toBe(200_030);
-      expect(store.revision()).toBeGreaterThan(before);
-      expect(store.isCorrectionDone()).toBe(true);
-    });
-
-    test("Correction is idempotent", () => {
-      const store = open();
-      store.upsertLive(row({ id: "a" }));
-      store.applyCacheWriteCorrection([{ id: "a", micros: 10 }], true);
-      expect(
-        store.applyCacheWriteCorrection([{ id: "a", micros: 99 }], true),
-      ).toBe(0);
-      expect(store.summary(0, 10_000).totalMicros).toBe(100_010);
-    });
-
-    test("only zero add-ons are overwritten and unknown ids are ignored", () => {
-      const store = open();
-      store.upsertLive(row({ id: "a", cacheWriteExtraMicros: 5 }));
-      store.applyCacheWriteCorrection(
-        [
-          { id: "a", micros: 10 },
-          { id: "ghost", micros: 1 },
-        ],
-        true,
-      );
-      expect(store.summary(0, 10_000).totalMicros).toBe(100_005);
-    });
-
-    test("An incomplete correction applies rows but leaves the marker unset", () => {
-      const store = open();
-      store.upsertLive(row({ id: "a" }));
-      expect(
-        store.applyCacheWriteCorrection([{ id: "a", micros: 10 }], false),
-      ).toBe(1);
-      expect(store.isCorrectionDone()).toBe(false);
-      expect(store.summary(0, 10_000).totalMicros).toBe(100_010);
-    });
-
-    test("Concurrent corrections apply once", () => {
-      const a = open();
-      const b = open();
-      a.upsertLive(row({ id: "a" }));
-      expect(a.applyCacheWriteCorrection([{ id: "a", micros: 10 }], true)).toBe(
-        1,
-      );
-      expect(b.applyCacheWriteCorrection([{ id: "a", micros: 10 }], true)).toBe(
-        0,
-      );
-      expect(b.summary(0, 10_000).totalMicros).toBe(100_010);
+      expect(total(a, 0, 1_000)).toBe(5);
+      expect(total(b, 0, 1_000)).toBe(5);
+      expect(columns().filter((n) => n === "tokens_input")).toHaveLength(1);
     });
   });
 

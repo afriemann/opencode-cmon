@@ -1,4 +1,5 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-display/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
 // spec: openspec/changes/refine-cost-display/specs/cost-display/spec.md
 // spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
 // spec: openspec/changes/fix-missing-models-crash/specs/cost-display/spec.md
@@ -33,6 +34,7 @@ const SUMMARY: Summary = {
     { model: "anthropic/claude-sonnet-4-5", micros: 9_000_000 },
     { model: "openai/gpt-5-mini", micros: 3_340_000 },
   ],
+  complete: true,
 };
 
 function fakeClient(
@@ -127,7 +129,13 @@ describe("cost text", () => {
     expect(
       amount({
         kind: "ready",
-        summary: { revision: 0, totalMicros: 0, agents: [], models: [] },
+        summary: {
+          revision: 0,
+          totalMicros: 0,
+          agents: [],
+          models: [],
+          complete: true,
+        },
       }),
     ).toBe("$0.00");
   });
@@ -150,6 +158,7 @@ describe("cost text", () => {
       totalMicros: 100_000,
       agents: [{ agent: "build", micros: 100_000 }],
       models: [],
+      complete: true,
     };
     expect(footerLine({ kind: "ready", summary }, true)).toBe(
       "▼ $0.10 · build $0.10",
@@ -246,5 +255,39 @@ describe("footer and placement", () => {
     const sidebar = claims.find((c) => c.prepend === "sidebar.content");
     expect(sidebar).toBeDefined();
     expect(claims.some((c) => c.append === "sidebar.content")).toBe(false);
+  });
+
+  describe("incomplete pricing", () => {
+    const incomplete: FeedState = {
+      kind: "ready",
+      summary: { ...SUMMARY, complete: false },
+    };
+
+    test("Incomplete total is marked", () => {
+      expect(amount(incomplete)).toBe("~$12.34");
+      expect(footerLine(incomplete, false)).toBe("▶ ~$12.34 this month");
+      expect(
+        footerLine(incomplete, true).startsWith("▼ ~$12.34 · build $8.10"),
+      ).toBe(true);
+    });
+
+    test("agent and model lines carry no marker", () => {
+      for (const breakdown of ["agent", "model"] as const) {
+        expect(
+          breakdownLines(incomplete, breakdown).every(
+            (line) => !line.amount.includes("~"),
+          ),
+        ).toBe(true);
+      }
+    });
+
+    test("Complete total is unmarked", () => {
+      expect(amount({ kind: "ready", summary: SUMMARY })).toBe("$12.34");
+    });
+
+    test("a summary without the field renders as before", () => {
+      const older = { ...SUMMARY, complete: undefined } as unknown as Summary;
+      expect(amount({ kind: "ready", summary: older })).toBe("$12.34");
+    });
   });
 });

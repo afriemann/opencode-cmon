@@ -1,12 +1,6 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { usdToMicros } from "./money";
-import {
-  cacheWriteExtraMicros,
-  hasCopilotClaudePrices,
-  priceKey,
-  type PriceTable,
-} from "./pricing";
 import type { Store } from "./store";
 import { COMPACTION_AGENT, UNKNOWN, type CostRow } from "./types";
 
@@ -14,8 +8,6 @@ export interface BackfillOptions {
   readonly sourcePath: string;
   /** Epoch ms; messages created before this are not imported. */
   readonly cutoff: number;
-  /** Snapshot of model prices; without a Copilot Claude price no add-on can be computed. */
-  readonly prices: PriceTable;
   readonly log: (message: string) => void;
 }
 
@@ -65,7 +57,7 @@ function readSourceRows(sourcePath: string, cutoff: number): SourceRow[] {
 }
 
 /** Maps source messages to rows using the same rules as the live recorder. */
-function mapRows(rows: readonly SourceRow[], prices: PriceTable): CostRow[] {
+function mapRows(rows: readonly SourceRow[]): CostRow[] {
   const lastAgent = new Map<string, string>();
   const result: CostRow[] = [];
   for (const row of rows) {
@@ -74,8 +66,6 @@ function mapRows(rows: readonly SourceRow[], prices: PriceTable): CostRow[] {
     if (typeof row.cost !== "number" || !row.has_tokens) continue;
     if (!isStep && row.status !== "completed" && row.status !== "failed")
       continue;
-    const providerId = row.provider_id ?? UNKNOWN;
-    const modelId = row.model_id ?? UNKNOWN;
     result.push({
       id: row.id,
       sessionId: row.session_id,
@@ -83,19 +73,16 @@ function mapRows(rows: readonly SourceRow[], prices: PriceTable): CostRow[] {
       agent: isStep
         ? (row.agent ?? UNKNOWN)
         : (lastAgent.get(row.session_id) ?? COMPACTION_AGENT),
-      providerId,
-      modelId,
+      providerId: row.provider_id ?? UNKNOWN,
+      modelId: row.model_id ?? UNKNOWN,
       kind: isStep ? "step" : "compaction",
       failed: isStep ? false : row.status === "failed",
       costMicros: usdToMicros(row.cost),
-      cacheWriteExtraMicros: cacheWriteExtraMicros(
-        {
-          input: row.tokens_input ?? 0,
-          cacheRead: row.tokens_cache_read ?? 0,
-          cacheWrite: row.tokens_cache_write ?? 0,
-        },
-        prices.get(priceKey(providerId, modelId)),
-      ),
+      tokens: {
+        input: row.tokens_input ?? 0,
+        cacheRead: row.tokens_cache_read ?? 0,
+        cacheWrite: row.tokens_cache_write ?? 0,
+      },
       createdAt: row.created ?? row.time_created,
     });
   }
@@ -112,73 +99,77 @@ export function runBackfill(store: Store, options: BackfillOptions): void {
     if (!existsSync(options.sourcePath))
       throw new Error(`source database not found: ${options.sourcePath}`);
     store.completeBackfill(
-      mapRows(
-        readSourceRows(options.sourcePath, options.cutoff),
-        options.prices,
-      ),
+      mapRows(readSourceRows(options.sourcePath, options.cutoff)),
     );
   } catch (error) {
     options.log(`backfill skipped, will retry next start: ${String(error)}`);
   }
 }
 
-const CLAUDE_ID_PREFIX = "claude-";
-const COPILOT_PROVIDER = "github-copilot";
-/** Last deferral message per store, so retries on every catalog update do not repeat the same line. */
-const lastDeferral = new WeakMap<Store, string>();
+const FILL_CHUNK_SIZE = 500;
 
-/** Copilot Claude models that have cache-write tokens in the data but no priced catalog entry. */
-function unpricedModels(
-  rows: readonly SourceRow[],
-  prices: PriceTable,
-): string[] {
-  const missing = new Set<string>();
-  for (const row of rows) {
-    if ((row.tokens_cache_write ?? 0) <= 0) continue;
-    if (row.provider_id !== COPILOT_PROVIDER) continue;
-    if (!row.model_id?.startsWith(CLAUDE_ID_PREFIX)) continue;
-    const price = prices.get(priceKey(row.provider_id, row.model_id));
-    if (!price || price.cost.length === 0) missing.add(row.model_id);
-  }
-  return [...missing].sort();
+interface TokenSourceRow {
+  id: string;
+  has_tokens: number;
+  tokens_input: number | null;
+  tokens_cache_read: number | null;
+  tokens_cache_write: number | null;
 }
 
 /**
- * One-time correction of existing rows: sets the cache-write add-on from the source message's model
- * and tokens, for every row whose model is priced. The marker is set only once every Copilot Claude
- * model with cache-write tokens in the data is priced, so models missing from the catalog keep the
- * correction rerunning (idempotently). Fails soft. Returns whether any row changed.
+ * Fills token counts of rows that lack them, on every start while any exist (no marker; the
+ * `IS NULL` guard makes it idempotent). Messages are looked up by id, outside the cmon lock, in
+ * chunks that each commit on their own. Zeros are written only for messages a successful read
+ * confirmed absent or without token data; any read failure writes nothing more and the next start
+ * retries. Returns how many rows were filled.
  */
-export function runCacheWriteCorrection(
+export function runTokenFill(
   store: Store,
-  options: BackfillOptions,
-): boolean {
-  if (store.isCorrectionDone() || !hasCopilotClaudePrices(options.prices))
-    return false;
+  options: Pick<BackfillOptions, "sourcePath" | "cutoff" | "log">,
+): number {
+  let filled = 0;
   try {
+    const ids = store.idsMissingTokens(options.cutoff);
+    if (ids.length === 0) return 0;
     if (!existsSync(options.sourcePath))
       throw new Error(`source database not found: ${options.sourcePath}`);
-    const source = readSourceRows(options.sourcePath, options.cutoff);
-    const unpriced = unpricedModels(source, options.prices);
-    const updates = mapRows(source, options.prices)
-      .filter((row) => row.cacheWriteExtraMicros > 0)
-      .map((row) => ({ id: row.id, micros: row.cacheWriteExtraMicros }));
-    const changedRows = store.applyCacheWriteCorrection(
-      updates,
-      unpriced.length === 0,
-    );
-    if (changedRows > 0)
-      options.log(`cache-write correction: priced ${changedRows} rows`);
-    if (unpriced.length > 0) {
-      const message = `cache-write correction incomplete: no price for ${unpriced.join(", ")} (catalog has ${options.prices.size} models)`;
-      if (lastDeferral.get(store) !== message) {
-        lastDeferral.set(store, message);
-        options.log(message);
+    const db = new Database(options.sourcePath, { readonly: true });
+    try {
+      db.exec("PRAGMA busy_timeout = 5000");
+      for (let start = 0; start < ids.length; start += FILL_CHUNK_SIZE) {
+        const chunk = ids.slice(start, start + FILL_CHUNK_SIZE);
+        const found = new Map(
+          (
+            db
+              .query(
+                `SELECT id, json_extract(data, '$.tokens') IS NOT NULL AS has_tokens,
+                        json_extract(data, '$.tokens.input') AS tokens_input,
+                        json_extract(data, '$.tokens.cache.read') AS tokens_cache_read,
+                        json_extract(data, '$.tokens.cache.write') AS tokens_cache_write
+                 FROM session_message WHERE id IN (${chunk.map(() => "?").join(",")})`,
+              )
+              .all(...chunk) as TokenSourceRow[]
+          ).map((row) => [row.id, row]),
+        );
+        filled += store.fillTokens(
+          chunk.map((id) => {
+            const row = found.get(id);
+            return {
+              id,
+              tokens: {
+                input: row?.has_tokens ? (row.tokens_input ?? 0) : 0,
+                cacheRead: row?.has_tokens ? (row.tokens_cache_read ?? 0) : 0,
+                cacheWrite: row?.has_tokens ? (row.tokens_cache_write ?? 0) : 0,
+              },
+            };
+          }),
+        );
       }
+    } finally {
+      db.close();
     }
-    return changedRows > 0;
   } catch (error) {
-    options.log(`cache-write correction skipped, will retry: ${String(error)}`);
-    return false;
+    options.log(`token fill stopped, will retry next start: ${String(error)}`);
   }
+  return filled;
 }

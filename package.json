@@ -1,0 +1,49 @@
+{
+  "name": "opencode-cmon",
+  "version": "0.1.0",
+  "description": "Tracks opencode cost per calendar month (per agent, including sub-agents) in a local SQLite database, with a collapsible TUI block.",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./rpc": "./src/rpc.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node script/build-tui.mjs",
+    "test": "TZ=Europe/Berlin bun test --conditions=browser",
+    "lint": "eslint ."
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.0",
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.14",
+    "@opentui/core": "^0.5.12",
+    "@opentui/solid": "^0.5.12",
+    "solid-js": "^1.9.15",
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.0",
+    "eslint": "^9.0.0",
+    "@eslint/js": "^9.0.0",
+    "typescript-eslint": "^8.0.0",
+    "prettier": "^3.3.0"
+  }
+}

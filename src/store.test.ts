@@ -240,11 +240,14 @@ describe("store", () => {
       store.completeBackfill([row({ id: "b" })]);
       const before = store.revision();
       expect(
-        store.applyCacheWriteCorrection([
-          { id: "a", micros: 10 },
-          { id: "b", micros: 20 },
-        ]),
-      ).toBe(true);
+        store.applyCacheWriteCorrection(
+          [
+            { id: "a", micros: 10 },
+            { id: "b", micros: 20 },
+          ],
+          true,
+        ),
+      ).toBe(2);
       expect(store.summary(0, 10_000).totalMicros).toBe(200_030);
       expect(store.revision()).toBeGreaterThan(before);
       expect(store.isCorrectionDone()).toBe(true);
@@ -253,30 +256,45 @@ describe("store", () => {
     test("Correction is idempotent", () => {
       const store = open();
       store.upsertLive(row({ id: "a" }));
-      store.applyCacheWriteCorrection([{ id: "a", micros: 10 }]);
-      expect(store.applyCacheWriteCorrection([{ id: "a", micros: 99 }])).toBe(
-        false,
-      );
+      store.applyCacheWriteCorrection([{ id: "a", micros: 10 }], true);
+      expect(
+        store.applyCacheWriteCorrection([{ id: "a", micros: 99 }], true),
+      ).toBe(0);
       expect(store.summary(0, 10_000).totalMicros).toBe(100_010);
     });
 
     test("only zero add-ons are overwritten and unknown ids are ignored", () => {
       const store = open();
       store.upsertLive(row({ id: "a", cacheWriteExtraMicros: 5 }));
-      store.applyCacheWriteCorrection([
-        { id: "a", micros: 10 },
-        { id: "ghost", micros: 1 },
-      ]);
+      store.applyCacheWriteCorrection(
+        [
+          { id: "a", micros: 10 },
+          { id: "ghost", micros: 1 },
+        ],
+        true,
+      );
       expect(store.summary(0, 10_000).totalMicros).toBe(100_005);
+    });
+
+    test("An incomplete correction applies rows but leaves the marker unset", () => {
+      const store = open();
+      store.upsertLive(row({ id: "a" }));
+      expect(
+        store.applyCacheWriteCorrection([{ id: "a", micros: 10 }], false),
+      ).toBe(1);
+      expect(store.isCorrectionDone()).toBe(false);
+      expect(store.summary(0, 10_000).totalMicros).toBe(100_010);
     });
 
     test("Concurrent corrections apply once", () => {
       const a = open();
       const b = open();
       a.upsertLive(row({ id: "a" }));
-      expect(a.applyCacheWriteCorrection([{ id: "a", micros: 10 }])).toBe(true);
-      expect(b.applyCacheWriteCorrection([{ id: "a", micros: 10 }])).toBe(
-        false,
+      expect(a.applyCacheWriteCorrection([{ id: "a", micros: 10 }], true)).toBe(
+        1,
+      );
+      expect(b.applyCacheWriteCorrection([{ id: "a", micros: 10 }], true)).toBe(
+        0,
       );
       expect(b.summary(0, 10_000).totalMicros).toBe(100_010);
     });

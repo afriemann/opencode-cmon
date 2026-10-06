@@ -15,7 +15,7 @@ export const CURRENT_SCHEMA_VERSION = 2;
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const BACKFILL_MARKER = "backfill_done";
 /** Versioned: bump it when the correction's preconditions change so existing databases rerun it. */
-const CORRECTION_MARKER = "cache_write_correction_v2_done";
+const CORRECTION_MARKER = "cache_write_correction_v3_done";
 
 export function opencodeDataDir(
   env: Record<string, string | undefined> = process.env,
@@ -177,26 +177,28 @@ export class Store {
   }
 
   /**
-   * Sets the add-on of existing rows that still have none, then sets the marker, in one write
-   * transaction. The marker is re-checked under the lock so concurrent processes apply it once;
-   * returns whether any row changed.
+   * Sets the add-on of existing rows that still have none in one write transaction. The marker is
+   * set only when `complete`, and re-checked under the lock so concurrent processes finish once;
+   * returns how many rows changed. `complete` is required so a premature marker cannot be set by
+   * omission.
    */
   applyCacheWriteCorrection(
     updates: ReadonlyArray<{ id: string; micros: number }>,
-  ): boolean {
+    complete: boolean,
+  ): number {
     const update = this.db.query(
       "UPDATE cost_entry SET cache_write_extra_micros = $micros WHERE id = $id AND cache_write_extra_micros = 0",
     );
-    const apply = this.db.transaction((): boolean => {
-      if (this.isCorrectionDone()) return false;
+    const apply = this.db.transaction((): number => {
+      if (this.isCorrectionDone()) return 0;
       let changed = 0;
       for (const { id, micros } of updates)
         changed += update.run({ $id: id, $micros: micros }).changes;
-      this.setMeta(CORRECTION_MARKER, String(Date.now()));
-      return changed > 0;
+      if (complete) this.setMeta(CORRECTION_MARKER, String(Date.now()));
+      return changed;
     });
     const changed = apply.immediate();
-    if (changed) this.revisionCounter += 1;
+    if (changed > 0) this.revisionCounter += 1;
     return changed;
   }
 

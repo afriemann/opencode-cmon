@@ -1,6 +1,7 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
 // spec: openspec/changes/account-for-cache-writes/specs/cost-retention/spec.md
 // spec: openspec/changes/fix-correction-marker/specs/cost-retention/spec.md
+// spec: openspec/changes/price-all-models-before-marker/specs/cost-retention/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -404,6 +405,114 @@ describe("backfill", () => {
       expect(store.isCorrectionDone()).toBe(false);
     });
 
+    test("An unpriced model does not block pricing the others", () => {
+      const db = createSource();
+      for (const [id, model] of [
+        ["a", "claude-sonnet-4.6"],
+        ["b", "claude-opus-9"],
+      ] as const) {
+        addMessage(db, id, "s", "assistant", NOW, {
+          agent: "build",
+          model: { providerID: "github-copilot", id: model },
+          cost: 0.1,
+          tokens: WRITE_TOKENS,
+          time: { created: NOW },
+        });
+      }
+      db.close();
+      runBackfill(store, {
+        sourcePath,
+        cutoff: CUTOFF,
+        prices: NO_PRICES,
+        log,
+      });
+      logs.length = 0;
+      expect(
+        runCacheWriteCorrection(store, {
+          sourcePath,
+          cutoff: CUTOFF,
+          prices: PRICES,
+          log,
+        }),
+      ).toBe(true);
+      expect(store.isCorrectionDone()).toBe(false);
+      expect(store.summary(0, 3_000_000).totalMicros).toBe(200_000 + 2_500_000);
+      expect(logs.join("\n")).toContain("claude-opus-9");
+    });
+
+    test("A repeated deferral is logged once", () => {
+      const db = createSource();
+      addMessage(db, "b", "s", "assistant", NOW, {
+        agent: "build",
+        model: { providerID: "github-copilot", id: "claude-opus-9" },
+        cost: 0.1,
+        tokens: WRITE_TOKENS,
+        time: { created: NOW },
+      });
+      db.close();
+      runBackfill(store, {
+        sourcePath,
+        cutoff: CUTOFF,
+        prices: NO_PRICES,
+        log,
+      });
+      logs.length = 0;
+      const options = { sourcePath, cutoff: CUTOFF, prices: PRICES, log };
+      runCacheWriteCorrection(store, options);
+      runCacheWriteCorrection(store, options);
+      expect(logs).toHaveLength(1);
+    });
+
+    test("models without cache-write tokens do not block the correction", () => {
+      sourceWithWrites();
+      const db = new Database(sourcePath);
+      db.query(
+        "INSERT INTO session_message VALUES ('z','s','assistant',99,$t,$d)",
+      ).run({
+        $t: NOW,
+        $d: JSON.stringify({
+          agent: "x",
+          model: { providerID: "github-copilot", id: "claude-opus-9" },
+          cost: 0.1,
+          tokens: TOKENS,
+          time: { created: NOW },
+        }),
+      });
+      db.close();
+      runBackfill(store, {
+        sourcePath,
+        cutoff: CUTOFF,
+        prices: NO_PRICES,
+        log,
+      });
+      expect(
+        runCacheWriteCorrection(store, {
+          sourcePath,
+          cutoff: CUTOFF,
+          prices: PRICES,
+          log,
+        }),
+      ).toBe(true);
+    });
+
+    test("A successful correction logs what it priced", () => {
+      sourceWithWrites();
+      runBackfill(store, {
+        sourcePath,
+        cutoff: CUTOFF,
+        prices: NO_PRICES,
+        log,
+      });
+      logs.length = 0;
+      runCacheWriteCorrection(store, {
+        sourcePath,
+        cutoff: CUTOFF,
+        prices: PRICES,
+        log,
+      });
+      expect(logs.join("\n")).toMatch(/priced 2 rows/);
+    });
+
     test("A premature earlier marker does not suppress the correction", () => {
       sourceWithWrites();
       runBackfill(store, {
@@ -416,7 +525,7 @@ describe("backfill", () => {
       const raw = new Database(join(dir, "cmon.db"));
       raw
         .query(
-          "INSERT INTO meta (key, value) VALUES ('cache_write_correction_done', '1')",
+          "INSERT INTO meta (key, value) VALUES ('cache_write_correction_v2_done', '1')",
         )
         .run();
       raw.close();

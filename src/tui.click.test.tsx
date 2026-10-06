@@ -1,6 +1,8 @@
 // spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
+// spec: openspec/changes/unselectable-controls/specs/cost-display/spec.md
 import { describe, expect, test } from "bun:test";
 import { testRender } from "@opentui/solid";
+import { createStore, produce } from "solid-js/store";
 import { CostSidebar } from "./tui";
 import type { Summary } from "./types";
 
@@ -15,11 +17,12 @@ const SUMMARY: Summary = {
 
 interface Setup {
   readonly open?: boolean;
+  readonly width?: number;
   readonly summary?: () => Promise<Summary>;
 }
 
 function context({ open = true, summary }: Setup, saves: unknown[]) {
-  const view = { open };
+  const [view, setView] = createStore({ open });
   const color = (base: string) => ({ base });
   return {
     client: {
@@ -32,7 +35,7 @@ function context({ open = true, summary }: Setup, saves: unknown[]) {
       store: () => [
         view,
         async (mutate: (draft: { open: boolean }) => void) => {
-          mutate(view);
+          setView(produce(mutate));
           saves.push({ ...view });
         },
       ],
@@ -49,10 +52,11 @@ function context({ open = true, summary }: Setup, saves: unknown[]) {
 }
 
 async function render(setup: Setup = {}) {
+  const { width = 40 } = setup;
   const saves: unknown[] = [];
   const t = await testRender(
     () => <CostSidebar context={context(setup, saves)} />,
-    { width: 40, height: 8 },
+    { width, height: 8 },
   );
   const frame = async (): Promise<string[]> => {
     await Bun.sleep(20);
@@ -123,5 +127,77 @@ describe("sidebar tabs", () => {
       expect((await frame()).join("\n")).not.toContain("View");
       t.renderer.destroy();
     }
+  });
+});
+
+interface Walkable {
+  getChildren?(): Walkable[];
+  plainText?: string;
+  selectable?: boolean;
+}
+
+/** Selectable flag of every text renderable, keyed by its plain text. */
+function selectableByText(root: Walkable): Map<string, boolean> {
+  const found = new Map<string, boolean>();
+  const visit = (node: Walkable): void => {
+    if (typeof node.plainText === "string" && node.plainText !== "")
+      found.set(node.plainText, node.selectable ?? true);
+    for (const child of node.getChildren?.() ?? []) visit(child);
+  };
+  visit(root);
+  return found;
+}
+
+describe("sidebar chrome", () => {
+  test("Chrome is not selectable", async () => {
+    const { t, frame } = await render();
+    const rows = await frame();
+    const flags = selectableByText(t.renderer.root as unknown as Walkable);
+    for (const chrome of [
+      "▼",
+      "This month: ",
+      "View",
+      "[Agents]",
+      "Models",
+      "Providers",
+    ])
+      expect([chrome, flags.get(chrome)]).toEqual([chrome, false]);
+    for (const content of ["$12.34", "build"])
+      expect([content, flags.get(content)]).toEqual([content, true]);
+    expect(rows[0]!.trimEnd()).toBe("▼ This month: $12.34");
+    t.renderer.destroy();
+  });
+
+  test("Header layout holds in a narrow sidebar", async () => {
+    const { t, frame } = await render({ width: 22 });
+    expect((await frame())[0]!.trimEnd()).toBe("▼ This month: $12.34");
+    t.renderer.destroy();
+  });
+
+  test("Controls still work", async () => {
+    const { t, frame } = await render();
+    const rows = await frame();
+    await t.mockMouse.click(col(rows, "Providers"), 1);
+    expect((await frame())[1]!.trim()).toBe(
+      "View  Agents  Models  [Providers]",
+    );
+    await t.mockMouse.click(0, 0);
+    expect((await frame())[1] ?? "").not.toContain("View");
+    t.renderer.destroy();
+  });
+});
+
+describe("sidebar selection", () => {
+  test("A drag across the block selects only the content", async () => {
+    const { t, frame } = await render();
+    await frame();
+    await t.mockMouse.drag(6, 2, 0, 0);
+    await frame();
+    const selected = t.renderer.getSelection()?.getSelectedText() ?? "";
+    expect(selected).toContain("build");
+    expect(selected).not.toContain("This month");
+    expect(selected).not.toContain("View");
+    expect(selected).not.toContain("▼");
+    t.renderer.destroy();
   });
 });

@@ -189,21 +189,24 @@ export function CostSidebar(props: {
   return (
     <box>
       <box flexDirection="row" gap={1} onMouseDown={toggle}>
-        <text fg={theme.text.base}>{glyph(view.open)}</text>
-        <text fg={theme.text.base}>
-          <b>This month</b>
-          {": "}
-          <span
-            style={{
-              fg:
-                feed.state().kind === "error"
-                  ? theme.text.feedback.error.base
-                  : theme.text.base,
-            }}
+        <text fg={theme.text.base} selectable={false}>
+          {glyph(view.open)}
+        </text>
+        <box flexDirection="row">
+          <text fg={theme.text.base} selectable={false}>
+            <b>This month</b>
+            {": "}
+          </text>
+          <text
+            fg={
+              feed.state().kind === "error"
+                ? theme.text.feedback.error.base
+                : theme.text.base
+            }
           >
             {amount(feed.state())}
-          </span>
-        </text>
+          </text>
+        </box>
       </box>
       <Show when={view.open}>
         <Show when={feed.state().kind === "ready"}>
@@ -212,6 +215,7 @@ export function CostSidebar(props: {
               {(segment) => (
                 <text
                   fg={theme.text.action.primary.base}
+                  selectable={false}
                   onMouseDown={() => {
                     if (segment.mode) setBreakdown(segment.mode);
                   }}

@@ -134,9 +134,13 @@ export function breakdownLines(
 ): ReadonlyArray<{ label: string; amount: string }> {
   if (state.kind !== "ready") return [];
   const { agents, models } = state.summary;
-  return breakdown === "agent"
-    ? agents.map((e) => ({ label: e.agent, amount: formatUsd(e.micros) }))
-    : models.map((e) => ({ label: e.model, amount: formatUsd(e.micros) }));
+  if (breakdown === "agent")
+    return agents.map((e) => ({ label: e.agent, amount: formatUsd(e.micros) }));
+  // A server process still running an older plugin replies without `models`.
+  return (models ?? []).map((e) => ({
+    label: e.model,
+    amount: formatUsd(e.micros),
+  }));
 }
 
 const BREAKDOWN_LABELS: ReadonlyArray<readonly [Breakdown, string]> = [

@@ -75,7 +75,7 @@ The plugin SHALL compute the add-on for backfilled messages from their stored to
 
 ### Requirement: Existing rows are corrected once
 
-The plugin SHALL, once per database and only when the price catalog contains priced `github-copilot` models and `opencode.db` is readable, set the add-on of existing rows whose add-on is 0 from the source message's model and tokens, then set a correction marker in the same transaction, running after backfill and before prune.
+The plugin SHALL, once per database and only when the price catalog contains a priced `github-copilot` Claude model and `opencode.db` is readable, set the add-on of existing rows whose add-on is 0 from the source message's model and tokens, then set a correction marker in the same transaction, running after backfill and before prune. A marker written by an earlier plugin version that corrected against an incomplete catalog MUST NOT suppress the correction.
 
 #### Scenario: Existing rows are corrected
 
@@ -97,6 +97,17 @@ The plugin SHALL, once per database and only when the price catalog contains pri
 
 - **WHEN** the catalog has models but none from `github-copilot` with a cost entry
 - **THEN** nothing changes and the marker stays unset
+
+#### Scenario: A catalog with Copilot but no Claude prices defers the correction
+
+- **WHEN** the catalog has priced `github-copilot` models but none of them is Claude
+- **THEN** nothing changes and the marker stays unset
+
+#### Scenario: A premature earlier marker does not suppress the correction
+
+- **GIVEN** a database whose only marker is the one set by the earlier plugin version
+- **WHEN** the correction runs with a catalog containing a priced Copilot Claude model
+- **THEN** the add-ons are set and the new marker is set
 
 #### Scenario: Missing source fails soft
 

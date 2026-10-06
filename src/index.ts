@@ -94,6 +94,7 @@ export default Plugin.define({
           totalMicros: built.totalMicros,
           agents: built.agents,
           models: built.models,
+          providers: built.providers,
           complete: built.complete,
         };
       },

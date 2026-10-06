@@ -5,6 +5,7 @@
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
+// spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -135,16 +136,28 @@ describe("store", () => {
       costMicros: number,
     ) => row({ id, providerId, modelId, costMicros });
     store.upsertLive(m("a", "p", "m1", 10));
-    store.upsertLive(m("b", "p", "m1", 15));
+    store.upsertLive(m("b", "q", "m1", 15));
     store.upsertLive(m("c", "p", "m2", 25));
-    store.upsertLive(m("d", "q", "m1", 25));
     const { models } = store.summaryInputs(0, 10_000);
     expect(
       models.slice().sort((x, y) => x.model.localeCompare(y.model)),
     ).toEqual([
-      { model: "p/m1", micros: 25 },
-      { model: "p/m2", micros: 25 },
-      { model: "q/m1", micros: 25 },
+      { model: "m1", micros: 25 },
+      { model: "m2", micros: 25 },
+    ]);
+  });
+
+  test("Providers are grouped by provider id", () => {
+    const store = open();
+    store.upsertLive(row({ id: "a", providerId: "zeta", costMicros: 5 }));
+    store.upsertLive(row({ id: "b", providerId: "big", costMicros: 30 }));
+    store.upsertLive(row({ id: "c", providerId: "big", costMicros: 30 }));
+    const { providers } = store.summaryInputs(0, 10_000);
+    expect(
+      providers.slice().sort((x, y) => x.provider.localeCompare(y.provider)),
+    ).toEqual([
+      { provider: "big", micros: 60 },
+      { provider: "zeta", micros: 5 },
     ]);
   });
 

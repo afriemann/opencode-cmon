@@ -1,9 +1,11 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-display/spec.md
 // spec: openspec/changes/refine-cost-display/specs/cost-display/spec.md
+// spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { createRoot } from "solid-js";
 import plugin, {
-  agentLines,
+  breakdownLines,
+  toggleSegments,
   createCostFeed,
   createOpenState,
   footerLine,
@@ -25,6 +27,10 @@ const SUMMARY: Summary = {
     { agent: "build", micros: 8_100_000 },
     { agent: "explore", micros: 3_020_000 },
     { agent: "general", micros: 1_220_000 },
+  ],
+  models: [
+    { model: "anthropic/claude-sonnet-4-5", micros: 9_000_000 },
+    { model: "openai/gpt-5-mini", micros: 3_340_000 },
   ],
 };
 
@@ -120,7 +126,7 @@ describe("cost text", () => {
     expect(
       amount({
         kind: "ready",
-        summary: { revision: 0, totalMicros: 0, agents: [] },
+        summary: { revision: 0, totalMicros: 0, agents: [], models: [] },
       }),
     ).toBe("$0.00");
   });
@@ -142,6 +148,7 @@ describe("cost text", () => {
       revision: 0,
       totalMicros: 100_000,
       agents: [{ agent: "build", micros: 100_000 }],
+      models: [],
     };
     expect(footerLine({ kind: "ready", summary }, true)).toBe(
       "▼ $0.10 · build $0.10",
@@ -151,12 +158,38 @@ describe("cost text", () => {
 
 describe("opened block", () => {
   test("Opened sidebar", () => {
-    expect(agentLines({ kind: "ready", summary: SUMMARY })).toEqual([
-      { agent: "build", amount: "$8.10" },
-      { agent: "explore", amount: "$3.02" },
-      { agent: "general", amount: "$1.22" },
+    expect(
+      breakdownLines({ kind: "ready", summary: SUMMARY }, "agent"),
+    ).toEqual([
+      { label: "build", amount: "$8.10" },
+      { label: "explore", amount: "$3.02" },
+      { label: "general", amount: "$1.22" },
     ]);
-    expect(agentLines({ kind: "loading" })).toEqual([]);
+    expect(breakdownLines({ kind: "loading" }, "agent")).toEqual([]);
+  });
+
+  test("Clicking the toggle shows models", () => {
+    expect(
+      breakdownLines({ kind: "ready", summary: SUMMARY }, "model"),
+    ).toEqual([
+      { label: "anthropic/claude-sonnet-4-5", amount: "$9.00" },
+      { label: "openai/gpt-5-mini", amount: "$3.34" },
+    ]);
+    expect(breakdownLines({ kind: "error" }, "model")).toEqual([]);
+  });
+
+  test("Default breakdown is by agent", () => {
+    const text = (mode: "agent" | "model") =>
+      toggleSegments(mode)
+        .map((s) => s.text)
+        .join("  ");
+    expect(text("agent")).toBe("View  [Agents]  Models");
+    expect(text("model")).toBe("View  Agents  [Models]");
+    expect(
+      toggleSegments("model")
+        .filter((s) => s.bold)
+        .map((s) => s.text),
+    ).toEqual(["[Models]"]);
   });
 
   test("Toggle applies everywhere", async () => {

@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { usdToMicros } from "./money";
 import {
   cacheWriteExtraMicros,
-  hasCopilotPrices,
+  hasCopilotClaudePrices,
   priceKey,
   type PriceTable,
 } from "./pricing";
@@ -14,7 +14,7 @@ export interface BackfillOptions {
   readonly sourcePath: string;
   /** Epoch ms; messages created before this are not imported. */
   readonly cutoff: number;
-  /** Snapshot of model prices; without Copilot prices no add-on can be computed. */
+  /** Snapshot of model prices; without a Copilot Claude price no add-on can be computed. */
   readonly prices: PriceTable;
   readonly log: (message: string) => void;
 }
@@ -131,7 +131,7 @@ export function runCacheWriteCorrection(
   store: Store,
   options: BackfillOptions,
 ): boolean {
-  if (store.isCorrectionDone() || !hasCopilotPrices(options.prices))
+  if (store.isCorrectionDone() || !hasCopilotClaudePrices(options.prices))
     return false;
   try {
     if (!existsSync(options.sourcePath))

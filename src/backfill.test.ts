@@ -1,5 +1,6 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
 // spec: openspec/changes/account-for-cache-writes/specs/cost-retention/spec.md
+// spec: openspec/changes/fix-correction-marker/specs/cost-retention/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -374,6 +375,64 @@ describe("backfill", () => {
         }),
       ).toBe(false);
       expect(store.isCorrectionDone()).toBe(false);
+    });
+
+    test("A catalog with Copilot but no Claude prices defers the correction", () => {
+      sourceWithWrites();
+      runBackfill(store, {
+        sourcePath,
+        cutoff: CUTOFF,
+        prices: NO_PRICES,
+        log,
+      });
+      const partial = parseCatalog([
+        {
+          id: "gpt-5.3-codex",
+          providerID: "github-copilot",
+          family: "gpt-codex",
+          cost: [{ input: 1, cache: { read: 0, write: 0 } }],
+        },
+      ]);
+      expect(
+        runCacheWriteCorrection(store, {
+          sourcePath,
+          cutoff: CUTOFF,
+          prices: partial,
+          log,
+        }),
+      ).toBe(false);
+      expect(store.isCorrectionDone()).toBe(false);
+    });
+
+    test("A premature earlier marker does not suppress the correction", () => {
+      sourceWithWrites();
+      runBackfill(store, {
+        sourcePath,
+        cutoff: CUTOFF,
+        prices: NO_PRICES,
+        log,
+      });
+      store.close();
+      const raw = new Database(join(dir, "cmon.db"));
+      raw
+        .query(
+          "INSERT INTO meta (key, value) VALUES ('cache_write_correction_done', '1')",
+        )
+        .run();
+      raw.close();
+      store = new Store({ dbPath: join(dir, "cmon.db") });
+      expect(store.isCorrectionDone()).toBe(false);
+      expect(
+        runCacheWriteCorrection(store, {
+          sourcePath,
+          cutoff: CUTOFF,
+          prices: PRICES,
+          log,
+        }),
+      ).toBe(true);
+      expect(store.summary(0, 3_000_000).totalMicros).toBe(
+        300_000 + 2 * 2_500_000,
+      );
     });
 
     test("Missing source fails soft for the correction", () => {

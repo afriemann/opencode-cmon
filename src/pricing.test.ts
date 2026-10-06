@@ -3,7 +3,7 @@ import { describe, expect, jest, test } from "bun:test";
 import {
   cacheWriteExtraMicros,
   createPriceLookup,
-  hasCopilotPrices,
+  hasCopilotClaudePrices,
   parseCatalog,
   selectTier,
   tokenCounts,
@@ -225,7 +225,31 @@ describe("PriceLookup", () => {
   });
 });
 
-describe("hasCopilotPrices", () => {
+describe("hasCopilotClaudePrices", () => {
+  test("recognises a Claude model by family when the id is not claude-prefixed", () => {
+    const byFamily = parseCatalog([
+      {
+        id: "sonnet-latest",
+        providerID: "github-copilot",
+        family: "claude-sonnet",
+        cost: [{ input: 1, cache: { read: 0, write: 0 } }],
+      },
+    ]);
+    expect(hasCopilotClaudePrices(byFamily)).toBe(true);
+  });
+
+  test("a Copilot catalog without Claude models is not enough", () => {
+    const gpt = parseCatalog([
+      {
+        id: "gpt-5.3-codex",
+        providerID: "github-copilot",
+        family: "gpt-codex",
+        cost: [{ input: 1, cache: { read: 0, write: 0 } }],
+      },
+    ]);
+    expect(hasCopilotClaudePrices(gpt)).toBe(false);
+  });
+
   test("requires a github-copilot model with a cost entry", () => {
     const other = parseCatalog([
       {
@@ -239,15 +263,15 @@ describe("hasCopilotPrices", () => {
     ]);
     const ok = parseCatalog([
       {
-        id: "x",
+        id: "claude-x",
         providerID: "github-copilot",
         cost: [{ input: 1, cache: { read: 0, write: 0 } }],
       },
     ]);
     expect([
-      hasCopilotPrices(other),
-      hasCopilotPrices(noCost),
-      hasCopilotPrices(ok),
+      hasCopilotClaudePrices(other),
+      hasCopilotClaudePrices(noCost),
+      hasCopilotClaudePrices(ok),
     ]).toEqual([false, false, true]);
   });
 });

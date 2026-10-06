@@ -75,7 +75,7 @@ The plugin SHALL compute the add-on for backfilled messages from their stored to
 
 ### Requirement: Existing rows are corrected once
 
-The plugin SHALL, once per database and only when the price catalog contains a priced `github-copilot` Claude model and `opencode.db` is readable, set the add-on of existing rows whose add-on is 0 from the source message's model and tokens, then set a correction marker in the same transaction, running after backfill and before prune. A marker written by an earlier plugin version that corrected against an incomplete catalog MUST NOT suppress the correction.
+The plugin SHALL, whenever `opencode.db` is readable and the price catalog contains a priced `github-copilot` Claude model and until it is complete, set the add-on of existing rows whose add-on is 0 from the source message's model and tokens, for every row whose model is priced, and SHALL set a correction marker in the same transaction only when every `github-copilot` Claude model that has cache-write tokens in the source data has a priced catalog entry, running after backfill and before prune. A marker written by an earlier plugin version that corrected against an incomplete catalog MUST NOT suppress the correction. The correction SHALL log how many rows it priced, or which models remain unpriced, without repeating an unchanged message.
 
 #### Scenario: Existing rows are corrected
 
@@ -102,6 +102,22 @@ The plugin SHALL, once per database and only when the price catalog contains a p
 
 - **WHEN** the catalog has priced `github-copilot` models but none of them is Claude
 - **THEN** nothing changes and the marker stays unset
+
+#### Scenario: An unpriced model does not block pricing the others
+
+- **GIVEN** source messages of `claude-sonnet-4.6` and `claude-opus-9` with cache-write tokens and a catalog that prices only the first
+- **WHEN** the correction runs
+- **THEN** the `claude-sonnet-4.6` rows are corrected, the `claude-opus-9` rows keep add-on 0, the marker stays unset and the log names `claude-opus-9`
+
+#### Scenario: A repeated deferral is logged once
+
+- **WHEN** the correction runs again with the same unpriced models
+- **THEN** the deferral message is not logged again
+
+#### Scenario: A successful correction logs what it priced
+
+- **WHEN** the correction completes
+- **THEN** it logs the number of rows priced
 
 #### Scenario: A premature earlier marker does not suppress the correction
 

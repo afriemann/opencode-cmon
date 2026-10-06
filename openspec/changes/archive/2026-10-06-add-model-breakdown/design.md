@@ -6,11 +6,11 @@ Mode: design. Domain: TUI (opentui/solid), single surface `CostSidebar` in `src/
 
 Verified against the opencode v2 theme source (`packages/theme/src/tui/schema.ts`, `CompleteThemeTokensDefinition`; `@opencode/plugin` is not installed in this worktree, so the plugin-types check could not be run — implementer re-confirms by type-check). Tokens in use or chosen:
 
-| Role | Token | Status |
-|---|---|---|
-| Header, total | `theme.text.base` | in use |
-| Breakdown lines | `theme.text.muted` | in use |
-| Error word | `theme.text.feedback.error.base` | in use |
+| Role                 | Token                            | Status                                   |
+| -------------------- | -------------------------------- | ---------------------------------------- |
+| Header, total        | `theme.text.base`                | in use                                   |
+| Breakdown lines      | `theme.text.muted`               | in use                                   |
+| Error word           | `theme.text.feedback.error.base` | in use                                   |
 | **Toggle row (new)** | `theme.text.action.primary.base` | exists, always defined (complete schema) |
 
 No new colour beyond that one token. `$hovered` etc. exist on the action token but hover styling is rejected (YAGNI; mouse-only terminal feedback is the mode change itself).

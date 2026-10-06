@@ -13,6 +13,7 @@ Switching the sidebar to by-model crashes the TUI when the server process still 
 ### New Capabilities
 
 ### Modified Capabilities
+
 - `cost-display`: the sidebar must not throw when the summary lacks a per-model list.
 
 ## Impact

@@ -82,7 +82,8 @@ export function amount(state: FeedState): string {
     case "error":
       return FAILED;
     case "ready":
-      return formatUsd(state.summary.totalMicros);
+      // `~` marks a total that may be understated because some pricing is unknown.
+      return `${state.summary.complete === false ? "~" : ""}${formatUsd(state.summary.totalMicros)}`;
   }
 }
 

@@ -1,13 +1,15 @@
 import { Plugin } from "@opencode/plugin";
-import { runBackfill, runCacheWriteCorrection } from "./backfill";
+import { runBackfill, runTokenFill } from "./backfill";
 import { createPriceLookup } from "./pricing";
 import { createRecorder, type CostEvent } from "./recorder";
 import { CostRpc } from "./rpc";
 import { opencodeDataDir, Store } from "./store";
+import { buildSummary } from "./summary";
 import { retentionCutoff } from "./time";
 import { join } from "node:path";
 
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_NOTIFY_DEBOUNCE_MS = 500;
 
 function stringOption(
   options: Record<string, unknown>,
@@ -15,6 +17,14 @@ function stringOption(
 ): string | undefined {
   const value = options[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function numberOption(
+  options: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  const value = options[key];
+  return typeof value === "number" ? value : undefined;
 }
 
 export default Plugin.define({
@@ -38,34 +48,60 @@ export default Plugin.define({
     const sourcePath =
       stringOption(options, "sourceDbPath") ??
       join(opencodeDataDir(), "opencode.db");
-    const lookup = createPriceLookup(() => ctx.model.list(), log);
-    const backfillOptions = async () => ({
-      sourcePath,
-      cutoff: retentionCutoff(new Date()),
-      prices: await lookup.current(),
-      log,
-    });
-    runBackfill(store, await backfillOptions());
-    runCacheWriteCorrection(store, await backfillOptions());
-    store.prune(retentionCutoff(new Date()));
+    const notifyDebounceMs =
+      numberOption(options, "notifyDebounceMs") ?? DEFAULT_NOTIFY_DEBOUNCE_MS;
 
-    const rpc = await ctx.rpc.register(CostRpc, {
+    // Every change notification goes through one trailing debounce, so bursts of writes or
+    // catalog updates make the TUI refresh once.
+    const registration: {
+      current?: Awaited<ReturnType<typeof ctx.rpc.register<typeof CostRpc>>>;
+    } = {};
+    let notifyTimer: ReturnType<typeof setTimeout> | undefined;
+    let disposed = false;
+    const scheduleNotify = (): void => {
+      if (notifyTimer || disposed) return;
+      notifyTimer = setTimeout(() => {
+        notifyTimer = undefined;
+        registration.current?.events
+          .emit("changed", { revision: store.revision() })
+          .catch((error: unknown) =>
+            log(`failed to emit changed: ${String(error)}`),
+          );
+      }, notifyDebounceMs);
+      notifyTimer.unref();
+    };
+
+    const lookup = createPriceLookup(
+      () => ctx.model.list(),
+      log,
+      scheduleNotify,
+    );
+    lookup.refresh("updated");
+
+    const cutoff = () => retentionCutoff(new Date());
+    runBackfill(store, { sourcePath, cutoff: cutoff(), log });
+    runTokenFill(store, { sourcePath, cutoff: cutoff(), log });
+    store.prune(cutoff());
+
+    registration.current = await ctx.rpc.register(CostRpc, {
       summary: async (input: unknown) => {
         const { from, to } = input as { from: number; to: number };
-        return store.summary(from, to);
+        const inputs = store.summaryInputs(from, to);
+        const built = buildSummary(inputs, inputs.candidates, lookup.table());
+        if (built.unpriced.length > 0) lookup.refresh("miss");
+        return {
+          revision: inputs.revision,
+          totalMicros: built.totalMicros,
+          agents: built.agents,
+          models: built.models,
+          complete: built.complete,
+        };
       },
     });
-    const notify = async (): Promise<void> => {
-      try {
-        await rpc.events.emit("changed", { revision: store.revision() });
-      } catch (error) {
-        log(`failed to emit changed: ${String(error)}`);
-      }
-    };
 
     const pruneTimer = setInterval(() => {
       try {
-        if (store.prune(retentionCutoff(new Date())) > 0) void notify();
+        if (store.prune(cutoff()) > 0) scheduleNotify();
       } catch (error) {
         log(`prune failed: ${String(error)}`);
       }
@@ -79,21 +115,8 @@ export default Plugin.define({
         };
         return session.parentID ?? null;
       },
-      prices: () => lookup.current(),
       now: Date.now,
     });
-
-    let correcting = false;
-    const correctAfterCatalogChange = async (): Promise<void> => {
-      if (correcting || store.isCorrectionDone()) return;
-      correcting = true;
-      try {
-        if (runCacheWriteCorrection(store, await backfillOptions()))
-          await notify();
-      } finally {
-        correcting = false;
-      }
-    };
 
     const abort = new AbortController();
     const loop = (async () => {
@@ -103,14 +126,13 @@ export default Plugin.define({
         })) {
           try {
             if (event.type === "model.updated") {
-              lookup.invalidate();
-              await correctAfterCatalogChange();
+              lookup.refresh("updated");
               continue;
             }
             const row = await recorder.handle(event as CostEvent);
             if (row) {
               store.upsertLive(row);
-              await notify();
+              scheduleNotify();
             }
           } catch (error) {
             log(`failed to record ${event.type}: ${String(error)}`);
@@ -126,7 +148,10 @@ export default Plugin.define({
       abort.abort();
       clearInterval(pruneTimer);
       await loop;
-      await rpc.dispose();
+      // After the loop: a late event or catalog change must not re-arm the timer.
+      disposed = true;
+      clearTimeout(notifyTimer);
+      await registration.current?.dispose();
       store.close();
     };
   },

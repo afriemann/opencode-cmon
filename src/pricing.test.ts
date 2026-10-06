@@ -1,9 +1,10 @@
 // spec: openspec/changes/account-for-cache-writes/specs/cost-recording/spec.md
+// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
 import { describe, expect, jest, test } from "bun:test";
 import {
   cacheWriteExtraMicros,
   createPriceLookup,
-  hasCopilotClaudePrices,
+  addOnApplies,
   parseCatalog,
   selectTier,
   tokenCounts,
@@ -163,6 +164,15 @@ describe("tokenCounts", () => {
   });
 });
 
+describe("addOnApplies", () => {
+  test("uses the entry's family when priced, the claude- prefix otherwise", () => {
+    expect(addOnApplies("github-copilot", "x", SONNET)).toBe(true);
+    expect(addOnApplies("github-copilot", "claude-old", undefined)).toBe(true);
+    expect(addOnApplies("github-copilot", "gpt-5", undefined)).toBe(false);
+    expect(addOnApplies("openrouter", "claude-x", undefined)).toBe(false);
+  });
+});
+
 describe("PriceLookup", () => {
   const entry = {
     id: "m",
@@ -170,108 +180,123 @@ describe("PriceLookup", () => {
     cost: [{ input: 1, cache: { read: 0, write: 0 } }],
   };
   const log = () => {};
+  const flush = async () => {
+    for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  };
 
-  test("loads once under concurrent calls", async () => {
+  test("table() is synchronous, empty before the first load and never loads", () => {
     let calls = 0;
     const lookup = createPriceLookup(
       async () => ((calls += 1), { data: [entry] }),
       log,
+      () => {},
     );
-    const [a, b] = await Promise.all([lookup.current(), lookup.current()]);
-    expect(calls).toBe(1);
-    expect(a).toBe(b);
-    await lookup.current();
-    expect(calls).toBe(1);
+    expect(lookup.table().size).toBe(0);
+    expect(calls).toBe(0);
   });
 
-  test("empty or failed loads keep the previous table and retry", async () => {
+  test("refresh loads once under concurrent calls and fires onChange when the catalog changes", async () => {
+    let calls = 0;
+    let changes = 0;
+    const lookup = createPriceLookup(
+      async () => ((calls += 1), { data: [entry] }),
+      log,
+      () => (changes += 1),
+    );
+    lookup.refresh("updated");
+    lookup.refresh("updated");
+    await flush();
+    expect(calls).toBe(2);
+    expect(lookup.table().size).toBe(1);
+    expect(changes).toBe(1);
+  });
+
+  test("an identical catalog does not fire onChange", async () => {
+    let changes = 0;
+    const lookup = createPriceLookup(
+      async () => ({ data: [entry] }),
+      log,
+      () => (changes += 1),
+    );
+    lookup.refresh("updated");
+    await flush();
+    lookup.refresh("updated");
+    await flush();
+    expect(changes).toBe(1);
+  });
+
+  test("Reloads are rate-limited", async () => {
+    let calls = 0;
+    let now = 1_000_000;
+    const lookup = createPriceLookup(
+      async () => ((calls += 1), { data: [] }),
+      log,
+      () => {},
+      () => now,
+    );
+    lookup.refresh("miss");
+    await flush();
+    lookup.refresh("miss");
+    await flush();
+    expect(calls).toBe(1);
+    now += 60_000;
+    lookup.refresh("miss");
+    await flush();
+    expect(calls).toBe(2);
+  });
+
+  test("an updated refresh is not rate-limited by misses", async () => {
+    let calls = 0;
+    const lookup = createPriceLookup(
+      async () => ((calls += 1), { data: [] }),
+      log,
+      () => {},
+      () => 5,
+    );
+    lookup.refresh("miss");
+    await flush();
+    lookup.refresh("updated");
+    await flush();
+    expect(calls).toBe(2);
+  });
+
+  test("empty or failed loads keep the previous table", async () => {
     const responses: unknown[] = [
       { data: [entry] },
       { data: [] },
       new Error("down"),
-      { data: [entry, { ...entry, id: "n" }] },
     ];
-    const lookup = createPriceLookup(async () => {
-      const next = responses.shift();
-      if (next instanceof Error) throw next;
-      return next;
-    }, log);
-    expect((await lookup.current()).size).toBe(1);
-    lookup.invalidate();
-    expect((await lookup.current()).size).toBe(1);
-    lookup.invalidate();
-    expect((await lookup.current()).size).toBe(1);
-    lookup.invalidate();
-    expect((await lookup.current()).size).toBe(2);
+    const lookup = createPriceLookup(
+      async () => {
+        const next = responses.shift();
+        if (next instanceof Error) throw next;
+        return next;
+      },
+      log,
+      () => {},
+    );
+    for (let i = 0; i < 3; i += 1) {
+      lookup.refresh("updated");
+      await flush();
+    }
+    expect(lookup.table().size).toBe(1);
   });
 
-  test("an empty first load retries on the next call", async () => {
-    const responses: unknown[] = [{ data: [] }, { data: [entry] }];
-    const lookup = createPriceLookup(async () => responses.shift(), log);
-    expect((await lookup.current()).size).toBe(0);
-    expect((await lookup.current()).size).toBe(1);
-  });
-
-  test("a hanging catalog load times out and yields the empty table", async () => {
+  test("A hanging catalog never stalls the summary", async () => {
     jest.useFakeTimers();
     try {
-      const lookup = createPriceLookup(() => new Promise(() => {}), log);
-      const pending = lookup.current();
+      const lookup = createPriceLookup(
+        () => new Promise(() => {}),
+        log,
+        () => {},
+      );
+      lookup.refresh("updated");
+      expect(lookup.table().size).toBe(0);
       jest.advanceTimersByTime(5_000);
-      expect((await pending).size).toBe(0);
+      await flush();
+      expect(lookup.table().size).toBe(0);
     } finally {
       jest.useRealTimers();
     }
-  });
-});
-
-describe("hasCopilotClaudePrices", () => {
-  test("recognises a Claude model by family when the id is not claude-prefixed", () => {
-    const byFamily = parseCatalog([
-      {
-        id: "sonnet-latest",
-        providerID: "github-copilot",
-        family: "claude-sonnet",
-        cost: [{ input: 1, cache: { read: 0, write: 0 } }],
-      },
-    ]);
-    expect(hasCopilotClaudePrices(byFamily)).toBe(true);
-  });
-
-  test("a Copilot catalog without Claude models is not enough", () => {
-    const gpt = parseCatalog([
-      {
-        id: "gpt-5.3-codex",
-        providerID: "github-copilot",
-        family: "gpt-codex",
-        cost: [{ input: 1, cache: { read: 0, write: 0 } }],
-      },
-    ]);
-    expect(hasCopilotClaudePrices(gpt)).toBe(false);
-  });
-
-  test("requires a github-copilot model with a cost entry", () => {
-    const other = parseCatalog([
-      {
-        id: "x",
-        providerID: "openrouter",
-        cost: [{ input: 1, cache: { read: 0, write: 0 } }],
-      },
-    ]);
-    const noCost = parseCatalog([
-      { id: "x", providerID: "github-copilot", cost: [] },
-    ]);
-    const ok = parseCatalog([
-      {
-        id: "claude-x",
-        providerID: "github-copilot",
-        cost: [{ input: 1, cache: { read: 0, write: 0 } }],
-      },
-    ]);
-    expect([
-      hasCopilotClaudePrices(other),
-      hasCopilotClaudePrices(noCost),
-      hasCopilotClaudePrices(ok),
-    ]).toEqual([false, false, true]);
   });
 });

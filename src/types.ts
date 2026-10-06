@@ -1,3 +1,5 @@
+import type { TokenCounts } from "./pricing";
+
 /** Attribution used when a row's agent or model cannot be determined. */
 export const UNKNOWN = "unknown";
 /** Agent for a compaction in a session with no prior step. */
@@ -16,8 +18,8 @@ export interface CostRow {
   readonly failed: boolean;
   /** opencode's own cost for the step. */
   readonly costMicros: number;
-  /** Cache-write cost opencode prices at zero but GitHub bills; added to `costMicros` for display. */
-  readonly cacheWriteExtraMicros: number;
+  /** Token counts for read-time pricing; null when the event carried no token data. */
+  readonly tokens: TokenCounts | null;
   /** UTC epoch milliseconds. */
   readonly createdAt: number;
 }
@@ -38,4 +40,15 @@ export interface Summary {
   readonly totalMicros: number;
   readonly agents: readonly AgentTotal[];
   readonly models: readonly ModelTotal[];
+  /** False when some row that could carry a cache-write cost could not be priced. */
+  readonly complete: boolean;
+}
+
+/** A row that may carry a cache-write cost, priced in code at read time. */
+export interface Candidate {
+  readonly agent: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  /** Null when the row's token counts are unknown. */
+  readonly tokens: TokenCounts | null;
 }

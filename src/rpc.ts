@@ -29,8 +29,20 @@ export const CostRpc = Rpc.define({
               required: ["agent", "micros"],
             },
           },
+          models: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                model: { type: "string" },
+                micros: { type: "number" },
+              },
+              required: ["model", "micros"],
+            },
+          },
+          complete: { type: "boolean" },
         },
-        required: ["revision", "totalMicros", "agents"],
+        required: ["revision", "totalMicros", "agents", "complete"],
       },
     },
   },

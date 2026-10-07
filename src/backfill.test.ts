@@ -1,11 +1,12 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
+// spec: openspec/changes/add-cost-analysis-tools/specs/cost-retention/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { runBackfill, runTokenFill } from "./backfill";
+import { runBackfill, runDetailFill, runTokenFill } from "./backfill";
 import { Store } from "./store";
 
 const TOKENS = {
@@ -33,7 +34,7 @@ const WRITE_TOKENS = {
 function createSource(): Database {
   const db = new Database(sourcePath, { create: true });
   db.exec(`
-    CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT);
+    CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT);
     CREATE TABLE session_message (
       id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
       seq INTEGER NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL
@@ -78,7 +79,7 @@ describe("backfill", () => {
   test("First start imports history", () => {
     const db = createSource();
     db.query(
-      "INSERT INTO session_v2 VALUES ('ses_p', NULL), ('ses_c', 'ses_p')",
+      "INSERT INTO session_v2 (id, parent_id) VALUES ('ses_p', NULL), ('ses_c', 'ses_p')",
     ).run();
     addMessage(db, "msg_a", "ses_p", "assistant", NOW, {
       agent: "build",
@@ -269,6 +270,10 @@ describe("backfill", () => {
       failed: false,
       costMicros: 10,
       tokens: null,
+      outputTokens: null,
+      reasoningTokens: null,
+      finish: null,
+      directory: null,
       createdAt,
     });
     const options = () => ({ sourcePath, cutoff: CUTOFF, log });
@@ -413,6 +418,173 @@ describe("backfill", () => {
         runTokenFill(other, options()),
       ]).toEqual([1, 0]);
       other.close();
+    });
+  });
+
+  describe("details", () => {
+    const raw = () => new Database(join(dir, "cmon.db"), { readonly: true });
+    const detailsOf = (id: string) =>
+      raw()
+        .query(
+          "SELECT tokens_output o, tokens_reasoning r, finish f, directory d, failed x, details_checked c FROM cost_entry WHERE id = $id",
+        )
+        .get({ $id: id });
+    const options = () => ({ sourcePath, cutoff: CUTOFF, log });
+    const live = (id: string, overrides: object = {}) => ({
+      id,
+      sessionId: "s",
+      parentSessionId: null,
+      agent: "build",
+      providerId: "github-copilot",
+      modelId: "claude-sonnet-4.6",
+      kind: "step" as const,
+      failed: false,
+      costMicros: 10,
+      tokens: { input: 1, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: null,
+      reasoningTokens: null,
+      finish: null,
+      directory: null,
+      createdAt: NOW,
+      ...overrides,
+    });
+    const step = (extra: object = {}) => ({
+      agent: "build",
+      model: MODEL,
+      cost: 0.1,
+      tokens: { ...TOKENS, output: 225, reasoning: 25 },
+      finish: "stop",
+      time: { created: NOW },
+      ...extra,
+    });
+    const sessionDir = (db: Database) =>
+      db
+        .query("INSERT INTO session_v2 (id, directory) VALUES ('s', '/work/a')")
+        .run();
+
+    test("Imported step carries details", () => {
+      const db = createSource();
+      sessionDir(db);
+      addMessage(db, "m1", "s", "assistant", NOW, step());
+      db.close();
+      runBackfill(store, options());
+      expect(detailsOf("m1")).toEqual({
+        o: 225,
+        r: 25,
+        f: "stop",
+        d: "/work/a",
+        x: 0,
+        c: 1,
+      });
+    });
+
+    test("Errored source step is imported as failed", () => {
+      const db = createSource();
+      sessionDir(db);
+      addMessage(
+        db,
+        "m1",
+        "s",
+        "assistant",
+        NOW,
+        step({ error: { type: "aborted", message: "Aborted" } }),
+      );
+      db.close();
+      runBackfill(store, options());
+      expect(detailsOf("m1")).toMatchObject({ x: 1, f: null });
+    });
+
+    test("Fill sets details", () => {
+      const db = createSource();
+      sessionDir(db);
+      addMessage(db, "m1", "s", "assistant", NOW, step());
+      db.close();
+      store.upsertLive(live("m1"));
+      expect(runDetailFill(store, options())).toBe(1);
+      expect(detailsOf("m1")).toEqual({
+        o: 225,
+        r: 25,
+        f: "stop",
+        d: "/work/a",
+        x: 0,
+        c: 1,
+      });
+    });
+
+    test("An absent source message is not queried again", () => {
+      createSource().close();
+      store.upsertLive(live("m1"));
+      expect(runDetailFill(store, options())).toBe(1);
+      expect(detailsOf("m1")).toEqual({
+        o: null,
+        r: null,
+        f: null,
+        d: null,
+        x: 0,
+        c: 1,
+      });
+      expect(runDetailFill(store, options())).toBe(0);
+      expect(store.idsMissingDetails(CUTOFF)).toEqual([]);
+    });
+
+    test("Fill corrects the failed flag of imported steps", () => {
+      const db = createSource();
+      sessionDir(db);
+      addMessage(
+        db,
+        "m1",
+        "s",
+        "assistant",
+        NOW,
+        step({ error: { type: "aborted" } }),
+      );
+      db.close();
+      store.completeBackfill([live("m1")]);
+      runDetailFill(store, options());
+      expect(detailsOf("m1")).toMatchObject({ x: 1 });
+    });
+
+    test("Fill does not fail a live step", () => {
+      const db = createSource();
+      sessionDir(db);
+      addMessage(
+        db,
+        "m1",
+        "s",
+        "assistant",
+        NOW,
+        step({ error: { type: "aborted" } }),
+      );
+      db.close();
+      store.upsertLive(live("m1"));
+      runDetailFill(store, options());
+      expect(detailsOf("m1")).toMatchObject({ x: 0 });
+    });
+
+    test("Unavailable source writes nothing", () => {
+      store.upsertLive(live("m1"));
+      expect(runDetailFill(store, options())).toBe(0);
+      expect(detailsOf("m1")).toMatchObject({ o: null, c: null });
+      expect(logs.length).toBeGreaterThan(0);
+    });
+
+    test("Concurrent fills apply once", () => {
+      const db = createSource();
+      sessionDir(db);
+      addMessage(db, "m1", "s", "assistant", NOW, step());
+      db.close();
+      store.upsertLive(live("m1"));
+      const other = new Store({ dbPath: join(dir, "cmon.db") });
+      expect([
+        runDetailFill(store, options()),
+        runDetailFill(other, options()),
+      ]).toEqual([1, 0]);
+      other.close();
+    });
+
+    test("a live row with known details is not queried", () => {
+      store.upsertLive(live("m1", { outputTokens: 1, directory: "/x" }));
+      expect(store.idsMissingDetails(CUTOFF)).toEqual([]);
     });
   });
 });

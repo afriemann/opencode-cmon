@@ -1,5 +1,6 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-recording/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
+// spec: openspec/changes/add-cost-analysis-tools/specs/cost-recording/spec.md
 import { describe, expect, test } from "bun:test";
 import { createRecorder, type CostEvent } from "./recorder";
 
@@ -18,9 +19,15 @@ const WRITE_TOKENS = {
   cache: { read: 5, write: 1_000_000 },
 };
 
-function recorder(parents: Record<string, string | null> = {}) {
+function recorder(
+  parents: Record<string, string | null> = {},
+  directories: Record<string, string> = {},
+) {
   return createRecorder({
-    resolveParent: async (sessionID) => parents[sessionID] ?? null,
+    resolveSession: async (sessionID) => ({
+      parentId: parents[sessionID] ?? null,
+      directory: directories[sessionID] ?? null,
+    }),
     now: () => 9_999,
   });
 }
@@ -42,7 +49,7 @@ const ended = (
 ): CostEvent => ({
   id: `evt_e_${assistantMessageID}`,
   type: "session.step.ended",
-  data: { sessionID, assistantMessageID, cost, tokens: TOKENS },
+  data: { sessionID, assistantMessageID, cost, tokens: TOKENS, finish: "stop" },
 });
 
 describe("recorder", () => {
@@ -60,6 +67,10 @@ describe("recorder", () => {
       failed: false,
       costMicros: 12_300,
       tokens: { input: 1, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: 1,
+      reasoningTokens: 0,
+      finish: "stop",
+      directory: null,
       createdAt: 5_000,
     });
   });
@@ -174,13 +185,100 @@ describe("recorder", () => {
 
   test("a failed parent lookup still records the row", async () => {
     const r = createRecorder({
-      resolveParent: async () => {
+      resolveSession: async () => {
         throw new Error("boom");
       },
       now: () => 1,
     });
     expect(await r.handle(ended("ses_1", "m", 0.01))).toMatchObject({
       parentSessionId: null,
+      directory: null,
+    });
+  });
+
+  describe("details", () => {
+    test("Step output and reasoning tokens are stored", async () => {
+      const r = recorder();
+      const result = await r.handle({
+        id: "evt_e",
+        type: "session.step.ended",
+        data: {
+          sessionID: "ses_1",
+          assistantMessageID: "m1",
+          cost: 0.01,
+          tokens: { ...TOKENS, output: 225, reasoning: 25 },
+          finish: "length",
+        },
+      });
+      expect(result).toMatchObject({
+        outputTokens: 225,
+        reasoningTokens: 25,
+        finish: "length",
+      });
+    });
+
+    test("Ended step stores its finish reason", async () => {
+      const r = recorder();
+      expect(await r.handle(ended("ses_1", "m1", 0.01))).toMatchObject({
+        finish: "stop",
+      });
+    });
+
+    test("Missing token data stores NULL", async () => {
+      const r = recorder();
+      const result = await r.handle({
+        id: "evt_c",
+        type: "session.compaction.ended",
+        data: { sessionID: "ses_1", model: MODEL, cost: 0.1 },
+      });
+      expect(result).toMatchObject({
+        outputTokens: null,
+        reasoningTokens: null,
+      });
+    });
+
+    test("Failed step and compaction have no finish reason", async () => {
+      const r = recorder();
+      const failed = await r.handle({
+        id: "evt_f",
+        type: "session.step.failed",
+        data: {
+          sessionID: "ses_1",
+          assistantMessageID: "m1",
+          cost: 0.01,
+          tokens: TOKENS,
+          finish: "content-filter",
+        },
+      });
+      const compaction = await r.handle({
+        id: "evt_c",
+        type: "session.compaction.ended",
+        data: { sessionID: "ses_1", cost: 0.1, tokens: TOKENS, finish: "stop" },
+      });
+      expect([failed?.finish, compaction?.finish]).toEqual([null, null]);
+    });
+
+    test("Event location wins", async () => {
+      const r = recorder({}, { ses_1: "/work/b" });
+      const result = await r.handle({
+        ...ended("ses_1", "m1", 0.01),
+        location: { directory: "/work/a" },
+      });
+      expect(result).toMatchObject({ directory: "/work/a" });
+    });
+
+    test("Session location is the fallback", async () => {
+      const r = recorder({}, { ses_1: "/work/b" });
+      expect(await r.handle(ended("ses_1", "m1", 0.01))).toMatchObject({
+        directory: "/work/b",
+      });
+    });
+
+    test("Unknown directory stays NULL", async () => {
+      const r = recorder();
+      expect(await r.handle(ended("ses_1", "m1", 0.01))).toMatchObject({
+        directory: null,
+      });
     });
   });
 

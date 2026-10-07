@@ -7,9 +7,31 @@ import type {
   AgentTotal,
   Candidate,
   CostRow,
+  EntryKind,
   ModelTotal,
   ProviderTotal,
 } from "./types";
+
+/** Narrows the rows an analysis reads. `[from, to)` is half-open epoch milliseconds. */
+export interface RowFilter {
+  readonly from: number;
+  readonly to: number;
+  readonly agent?: string;
+  readonly model?: string;
+  readonly provider?: string;
+  readonly kind?: EntryKind;
+  /** A session id; its descendant sessions are included unless `includeSubagents` is false. */
+  readonly session?: string;
+  readonly includeSubagents?: boolean;
+  /** An absolute directory; rows in it or below it (at a path boundary) match. */
+  readonly project?: string;
+}
+
+export interface FilteredRows {
+  readonly rows: CostRow[];
+  /** Rows that match every filter except `project` but have no known directory; empty without a project filter. */
+  readonly unknownDirectory: CostRow[];
+}
 
 export interface StoreOptions {
   dbPath?: string;
@@ -23,6 +45,17 @@ const TOKEN_COLUMNS = [
   "tokens_input",
   "tokens_cache_read",
   "tokens_cache_write",
+] as const;
+/**
+ * Nullable columns added without a schema version bump, so an older plugin process that opens the
+ * file keeps working (it ignores them). `details_checked` marks a row the detail fill has handled.
+ */
+const DETAIL_COLUMNS = [
+  ["tokens_output", "INTEGER"],
+  ["tokens_reasoning", "INTEGER"],
+  ["finish", "TEXT"],
+  ["directory", "TEXT"],
+  ["details_checked", "INTEGER"],
 ] as const;
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const BACKFILL_MARKER = "backfill_done";
@@ -65,8 +98,8 @@ CREATE INDEX IF NOT EXISTS cost_entry_created_at ON cost_entry(created_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `;
 
-const INSERT_COLUMNS = `(id, session_id, parent_session_id, agent, provider_id, model_id, kind, failed, cost_micros, tokens_input, tokens_cache_read, tokens_cache_write, created_at, source)
-VALUES ($id, $sessionId, $parentSessionId, $agent, $providerId, $modelId, $kind, $failed, $costMicros, $tokensInput, $tokensCacheRead, $tokensCacheWrite, $createdAt, $source)`;
+const INSERT_COLUMNS = `(id, session_id, parent_session_id, agent, provider_id, model_id, kind, failed, cost_micros, tokens_input, tokens_cache_read, tokens_cache_write, tokens_output, tokens_reasoning, finish, directory, details_checked, created_at, source)
+VALUES ($id, $sessionId, $parentSessionId, $agent, $providerId, $modelId, $kind, $failed, $costMicros, $tokensInput, $tokensCacheRead, $tokensCacheWrite, $tokensOutput, $tokensReasoning, $finish, $directory, $detailsChecked, $createdAt, $source)`;
 
 function bindings(row: CostRow, source: "live" | "backfill") {
   return {
@@ -82,8 +115,71 @@ function bindings(row: CostRow, source: "live" | "backfill") {
     $tokensInput: row.tokens?.input ?? null,
     $tokensCacheRead: row.tokens?.cacheRead ?? null,
     $tokensCacheWrite: row.tokens?.cacheWrite ?? null,
+    $tokensOutput: row.outputTokens,
+    $tokensReasoning: row.reasoningTokens,
+    $finish: row.finish,
+    $directory: row.directory,
+    // A row with its details known needs no fill; otherwise the fill gets one attempt.
+    $detailsChecked:
+      row.outputTokens !== null && row.directory !== null ? 1 : null,
     $createdAt: row.createdAt,
     $source: source,
+  };
+}
+
+/** Directory equals `$project` or lies below it at a path boundary (no LIKE, so no escaping). */
+const PROJECT_MATCH = `(directory = $project OR substr(directory, 1, length($project) + 1) = $project || '/'
+  OR ($project = '/' AND substr(directory, 1, 1) = '/'))`;
+
+function normaliseProject(project: string): string {
+  const trimmed = project.replace(/\/+$/, "");
+  return trimmed === "" ? "/" : trimmed;
+}
+
+interface StoredRow {
+  id: string;
+  session_id: string;
+  parent_session_id: string | null;
+  agent: string;
+  provider_id: string;
+  model_id: string;
+  kind: EntryKind;
+  failed: number;
+  cost_micros: number;
+  tokens_input: number | null;
+  tokens_cache_read: number | null;
+  tokens_cache_write: number | null;
+  tokens_output: number | null;
+  tokens_reasoning: number | null;
+  finish: string | null;
+  directory: string | null;
+  created_at: number;
+}
+
+function toCostRow(row: StoredRow): CostRow {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    parentSessionId: row.parent_session_id,
+    agent: row.agent,
+    providerId: row.provider_id,
+    modelId: row.model_id,
+    kind: row.kind,
+    failed: row.failed === 1,
+    costMicros: row.cost_micros,
+    tokens:
+      row.tokens_cache_write === null
+        ? null
+        : {
+            input: row.tokens_input ?? 0,
+            cacheRead: row.tokens_cache_read ?? 0,
+            cacheWrite: row.tokens_cache_write,
+          },
+    outputTokens: row.tokens_output,
+    reasoningTokens: row.tokens_reasoning,
+    finish: row.finish,
+    directory: row.directory,
+    createdAt: row.created_at,
   };
 }
 
@@ -120,7 +216,34 @@ export class Store {
    * processes starting together upgrade exactly once.
    */
   private migrate(): void {
-    if (this.schemaVersion() === CURRENT_SCHEMA_VERSION) return;
+    if (this.schemaVersion() !== CURRENT_SCHEMA_VERSION) this.migrateVersion();
+    this.ensureDetailColumns();
+  }
+
+  private columnNames(): Set<string> {
+    return new Set(
+      (
+        this.db.query("PRAGMA table_info(cost_entry)").all() as Array<{
+          name: string;
+        }>
+      ).map((column) => column.name),
+    );
+  }
+
+  /** Adds missing detail columns; the column list is re-read under the write lock so each is added once. */
+  private ensureDetailColumns(): void {
+    const missing = (): (typeof DETAIL_COLUMNS)[number][] =>
+      DETAIL_COLUMNS.filter(([name]) => !this.columnNames().has(name));
+    if (missing().length === 0) return;
+    this.db
+      .transaction(() => {
+        for (const [name, type] of missing())
+          this.db.exec(`ALTER TABLE cost_entry ADD COLUMN ${name} ${type}`);
+      })
+      .immediate();
+  }
+
+  private migrateVersion(): void {
     this.db
       .transaction(() => {
         const version = this.schemaVersion();
@@ -169,6 +292,11 @@ export class Store {
            tokens_input = COALESCE(excluded.tokens_input, cost_entry.tokens_input),
            tokens_cache_read = COALESCE(excluded.tokens_cache_read, cost_entry.tokens_cache_read),
            tokens_cache_write = COALESCE(excluded.tokens_cache_write, cost_entry.tokens_cache_write),
+           tokens_output = COALESCE(excluded.tokens_output, cost_entry.tokens_output),
+           tokens_reasoning = COALESCE(excluded.tokens_reasoning, cost_entry.tokens_reasoning),
+           finish = COALESCE(excluded.finish, cost_entry.finish),
+           directory = COALESCE(excluded.directory, cost_entry.directory),
+           details_checked = COALESCE(excluded.details_checked, cost_entry.details_checked),
            created_at = excluded.created_at, source = excluded.source
          WHERE cost_entry.source = 'backfill' OR cost_entry.agent = 'unknown'`,
       )
@@ -236,6 +364,116 @@ export class Store {
     const changed = apply.immediate();
     if (changed > 0) this.revisionCounter += 1;
     return changed;
+  }
+
+  /** Ids of rows in the retention window the detail fill has not handled yet. */
+  idsMissingDetails(since: number): string[] {
+    return (
+      this.db
+        .query(
+          "SELECT id FROM cost_entry WHERE details_checked IS NULL AND created_at >= $since ORDER BY id",
+        )
+        .all({ $since: since }) as Array<{ id: string }>
+    ).map((entry) => entry.id);
+  }
+
+  /**
+   * Applies source details to rows not yet handled and marks them handled, in one short write
+   * transaction so concurrent fills apply once. Values already stored are kept. `errored` marks an
+   * imported step as failed (live rows are already correct). Returns how many rows were handled.
+   */
+  fillDetails(
+    updates: ReadonlyArray<{
+      id: string;
+      outputTokens: number | null;
+      reasoningTokens: number | null;
+      finish: string | null;
+      directory: string | null;
+      errored: boolean;
+    }>,
+  ): number {
+    const update = this.db.query(
+      `UPDATE cost_entry SET
+         tokens_output = COALESCE(tokens_output, $output),
+         tokens_reasoning = COALESCE(tokens_reasoning, $reasoning),
+         finish = COALESCE(finish, $finish),
+         directory = COALESCE(directory, $directory),
+         failed = CASE WHEN $errored = 1 AND source = 'backfill' AND kind = 'step' THEN 1 ELSE failed END,
+         details_checked = 1
+       WHERE id = $id AND details_checked IS NULL`,
+    );
+    const apply = this.db.transaction((): number => {
+      let changed = 0;
+      for (const entry of updates) {
+        changed += update.run({
+          $id: entry.id,
+          $output: entry.outputTokens,
+          $reasoning: entry.reasoningTokens,
+          $finish: entry.finish,
+          $directory: entry.directory,
+          $errored: entry.errored ? 1 : 0,
+        }).changes;
+      }
+      return changed;
+    });
+    const changed = apply.immediate();
+    if (changed > 0) this.revisionCounter += 1;
+    return changed;
+  }
+
+  /** Rows in the retention window matching `filter`, read in one snapshot. */
+  filteredRows(filter: RowFilter): FilteredRows {
+    const conditions = ["created_at >= $from", "created_at < $to"];
+    const params: Record<string, string | number> = {
+      $from: filter.from,
+      $to: filter.to,
+    };
+    const equals: ReadonlyArray<[string, string, string | undefined]> = [
+      ["agent", "$agent", filter.agent],
+      ["model_id", "$model", filter.model],
+      ["provider_id", "$provider", filter.provider],
+      ["kind", "$kind", filter.kind],
+    ];
+    for (const [column, name, value] of equals) {
+      if (value === undefined) continue;
+      conditions.push(`${column} = ${name}`);
+      params[name] = value;
+    }
+    let withTree = "";
+    if (filter.session !== undefined) {
+      params.$session = filter.session;
+      if (filter.includeSubagents === false) {
+        conditions.push("session_id = $session");
+      } else {
+        withTree = `WITH RECURSIVE tree(id) AS (
+          SELECT $session
+          UNION
+          SELECT c.session_id FROM cost_entry c JOIN tree t ON c.parent_session_id = t.id
+        )`;
+        conditions.push("session_id IN (SELECT id FROM tree)");
+      }
+    }
+    const where = conditions.join(" AND ");
+    const select = `${withTree} SELECT id, session_id, parent_session_id, agent, provider_id, model_id, kind, failed,
+        cost_micros, tokens_input, tokens_cache_read, tokens_cache_write, tokens_output, tokens_reasoning,
+        finish, directory, created_at FROM cost_entry`;
+    const read = this.db.transaction((): FilteredRows => {
+      const query = (extra: string, bind: Record<string, string> = {}) =>
+        (
+          this.db
+            .query(`${select} WHERE ${where}${extra} ORDER BY created_at, id`)
+            .all({ ...params, ...bind }) as StoredRow[]
+        ).map(toCostRow);
+      if (filter.project === undefined)
+        return { rows: query(""), unknownDirectory: [] };
+      return {
+        rows: query(` AND ${PROJECT_MATCH}`, {
+          $project: normaliseProject(filter.project),
+        }),
+        unknownDirectory: query(" AND directory IS NULL"),
+      };
+    });
+    return read.deferred();
   }
 
   private totalsBy<T>(

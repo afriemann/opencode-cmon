@@ -1,8 +1,9 @@
 import { Plugin } from "@opencode/plugin";
-import { runBackfill, runTokenFill } from "./backfill";
+import { runBackfill, runDetailFill, runTokenFill } from "./backfill";
 import { createPriceLookup } from "./pricing";
 import { createRecorder, type CostEvent } from "./recorder";
 import { CostRpc } from "./rpc";
+import { createCostTools } from "./tools";
 import { opencodeDataDir, Store } from "./store";
 import { buildSummary } from "./summary";
 import { retentionCutoff } from "./time";
@@ -81,6 +82,7 @@ export default Plugin.define({
     const cutoff = () => retentionCutoff(new Date());
     runBackfill(store, { sourcePath, cutoff: cutoff(), log });
     runTokenFill(store, { sourcePath, cutoff: cutoff(), log });
+    runDetailFill(store, { sourcePath, cutoff: cutoff(), log });
     store.prune(cutoff());
 
     registration.current = await ctx.rpc.register(CostRpc, {
@@ -100,6 +102,28 @@ export default Plugin.define({
       },
     });
 
+    let closed = false;
+    const costTools = createCostTools({
+      store: () => {
+        if (closed) throw new Error("cost tracking stopped");
+        return store;
+      },
+      catalog: () => lookup.table(),
+      onIncomplete: () => lookup.refresh("miss"),
+      sessionDirectory: async (sessionID) => {
+        const session = (await ctx.session.get({ sessionID })) as {
+          location?: { directory?: string };
+        };
+        return session.location?.directory ?? null;
+      },
+      now: () => new Date(),
+    });
+    // The callback must not throw: the host replays it on every rebuild and a throw disables this
+    // plugin's registrations. It only adds tool objects built once above.
+    const toolRegistration = await ctx.tool.transform((editor) => {
+      for (const tool of costTools) editor.add(tool);
+    });
+
     const pruneTimer = setInterval(() => {
       try {
         if (store.prune(cutoff()) > 0) scheduleNotify();
@@ -110,11 +134,15 @@ export default Plugin.define({
     pruneTimer.unref();
 
     const recorder = createRecorder({
-      resolveParent: async (sessionID) => {
+      resolveSession: async (sessionID) => {
         const session = (await ctx.session.get({ sessionID })) as {
           parentID?: string;
+          location?: { directory?: string };
         };
-        return session.parentID ?? null;
+        return {
+          parentId: session.parentID ?? null,
+          directory: session.location?.directory ?? null,
+        };
       },
       now: Date.now,
     });
@@ -152,8 +180,13 @@ export default Plugin.define({
       // After the loop: a late event or catalog change must not re-arm the timer.
       disposed = true;
       clearTimeout(notifyTimer);
-      await registration.current?.dispose();
-      store.close();
+      try {
+        await toolRegistration.dispose();
+        await registration.current?.dispose();
+      } finally {
+        closed = true;
+        store.close();
+      }
     };
   },
 });

@@ -1,9 +1,4 @@
-import {
-  addOnApplies,
-  cacheWriteExtraMicros,
-  priceKey,
-  type PriceTable,
-} from "./pricing";
+import { rowAddOn, type PriceTable } from "./pricing";
 import type { AgentTotal, Candidate, ModelTotal, ProviderTotal } from "./types";
 
 export interface SummaryAggregate {
@@ -56,19 +51,13 @@ export function buildSummary(
   let complete = true;
 
   for (const row of candidates) {
-    const key = priceKey(row.providerId, row.modelId);
-    const price = catalog.get(key);
-    if (!addOnApplies(row.providerId, row.modelId, price)) continue;
-    if (row.tokens === null) {
+    const addOn = rowAddOn(row, catalog);
+    if (addOn.kind === "unknown") {
       complete = false;
+      if (addOn.reason === "price") unpriced.add(addOn.key);
       continue;
     }
-    if (!price || price.cost.length === 0) {
-      complete = false;
-      unpriced.add(key);
-      continue;
-    }
-    const extra = cacheWriteExtraMicros(row.tokens, price);
+    const extra = addOn.micros;
     if (extra === 0) continue;
     agents.set(row.agent, (agents.get(row.agent) ?? 0) + extra);
     models.set(row.modelId, (models.get(row.modelId) ?? 0) + extra);

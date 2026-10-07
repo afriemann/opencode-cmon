@@ -1,16 +1,23 @@
 import { usdToMicros } from "./money";
-import { tokenCounts } from "./pricing";
+import { detailTokens, tokenCounts } from "./pricing";
 import { COMPACTION_AGENT, UNKNOWN, type CostRow } from "./types";
 
 export interface CostEvent {
   readonly id: string;
   readonly type: string;
   readonly data: Readonly<Record<string, unknown>>;
+  /** The event envelope's location, when the host supplies one. */
+  readonly location?: { readonly directory?: string };
+}
+
+export interface SessionInfo {
+  readonly parentId: string | null;
+  readonly directory: string | null;
 }
 
 export interface RecorderDeps {
-  /** Returns the parent session ID, or null for a top-level session. */
-  readonly resolveParent: (sessionID: string) => Promise<string | null>;
+  /** Parent session ID (null for a top-level session) and directory (null when unknown). */
+  readonly resolveSession: (sessionID: string) => Promise<SessionInfo>;
   readonly now: () => number;
 }
 
@@ -56,22 +63,35 @@ export function createRecorder(deps: RecorderDeps): Recorder {
   const steps = new Map<string, StepState>();
   const lastStep = new Map<string, StepState>();
   const compactions = new Map<string, string>();
-  const parents = new Map<string, string | null>();
+  const sessions = new Map<string, SessionInfo>();
 
-  async function parentOf(sessionID: string): Promise<string | null> {
-    if (parents.has(sessionID)) return parents.get(sessionID) ?? null;
+  async function sessionOf(sessionID: string): Promise<SessionInfo> {
+    const cached = sessions.get(sessionID);
+    if (cached) return cached;
     try {
-      const parent = await deps.resolveParent(sessionID);
-      parents.set(sessionID, parent);
-      return parent;
+      const info = await deps.resolveSession(sessionID);
+      sessions.set(sessionID, info);
+      return info;
     } catch {
-      return null;
+      return { parentId: null, directory: null };
     }
+  }
+
+  /** Output and reasoning counts; null (unknown) when the event carries no token object. */
+  function outputCounts(tokens: unknown): {
+    outputTokens: number | null;
+    reasoningTokens: number | null;
+  } {
+    if (tokens === undefined || tokens === null)
+      return { outputTokens: null, reasoningTokens: null };
+    const { output, reasoning } = detailTokens(tokens);
+    return { outputTokens: output, reasoningTokens: reasoning };
   }
 
   async function stepRow(
     data: Readonly<Record<string, unknown>>,
     failed: boolean,
+    location: CostEvent["location"],
   ): Promise<CostRow | null> {
     const sessionId = str(data.sessionID);
     const id = str(data.assistantMessageID);
@@ -81,10 +101,11 @@ export function createRecorder(deps: RecorderDeps): Recorder {
     const own = steps.get(id);
     steps.delete(id);
     const state = own ?? lastStep.get(sessionId);
+    const session = await sessionOf(sessionId);
     return {
       id,
       sessionId,
-      parentSessionId: await parentOf(sessionId),
+      parentSessionId: session.parentId,
       agent: state?.agent ?? UNKNOWN,
       providerId: state?.providerId ?? UNKNOWN,
       modelId: state?.modelId ?? UNKNOWN,
@@ -92,6 +113,10 @@ export function createRecorder(deps: RecorderDeps): Recorder {
       failed,
       costMicros: usdToMicros(cost),
       tokens: tokenCounts(data.tokens),
+      ...outputCounts(data.tokens),
+      // A failed step's finish is always an error variant that `failed` already covers.
+      finish: failed ? null : (str(data.finish) ?? null),
+      directory: str(location?.directory) ?? session.directory,
       createdAt: own?.started ?? deps.now(),
     };
   }
@@ -113,10 +138,11 @@ export function createRecorder(deps: RecorderDeps): Recorder {
     compactions.delete(sessionId);
     const last = lastStep.get(sessionId);
     const model = modelRef(data.model) ?? last;
+    const session = await sessionOf(sessionId);
     return {
       id,
       sessionId,
-      parentSessionId: await parentOf(sessionId),
+      parentSessionId: session.parentId,
       agent: last?.agent ?? COMPACTION_AGENT,
       providerId: model?.providerId ?? UNKNOWN,
       modelId: model?.modelId ?? UNKNOWN,
@@ -125,6 +151,9 @@ export function createRecorder(deps: RecorderDeps): Recorder {
       costMicros: usdToMicros(cost),
       // Null means unknown: the startup fill (or a redelivery) resolves it.
       tokens: data.tokens == null ? null : tokenCounts(data.tokens),
+      ...outputCounts(data.tokens),
+      finish: null,
+      directory: str(event.location?.directory) ?? session.directory,
       createdAt: deps.now(),
     };
   }
@@ -149,9 +178,9 @@ export function createRecorder(deps: RecorderDeps): Recorder {
           return null;
         }
         case "session.step.ended":
-          return stepRow(data, false);
+          return stepRow(data, false, event.location);
         case "session.step.failed":
-          return stepRow(data, true);
+          return stepRow(data, true, event.location);
         case "session.compaction.started": {
           const sessionId = str(data.sessionID);
           if (sessionId)

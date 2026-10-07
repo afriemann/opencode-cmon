@@ -27,6 +27,11 @@ interface SourceRow {
   tokens_cache_write: number | null;
   created: number | null;
   parent_id: string | null;
+  tokens_output: number | null;
+  tokens_reasoning: number | null;
+  finish: string | null;
+  has_error: number;
+  directory: string | null;
 }
 
 function readSourceRows(sourcePath: string, cutoff: number): SourceRow[] {
@@ -35,7 +40,11 @@ function readSourceRows(sourcePath: string, cutoff: number): SourceRow[] {
     db.exec("PRAGMA busy_timeout = 5000");
     return db
       .query(
-        `SELECT m.id, m.session_id, m.type, m.time_created, s.parent_id,
+        `SELECT m.id, m.session_id, m.type, m.time_created, s.parent_id, s.directory,
+                json_extract(m.data, '$.tokens.output') AS tokens_output,
+                json_extract(m.data, '$.tokens.reasoning') AS tokens_reasoning,
+                json_extract(m.data, '$.finish') AS finish,
+                json_extract(m.data, '$.error') IS NOT NULL AS has_error,
                 json_extract(m.data, '$.agent') AS agent,
                 json_extract(m.data, '$.model.providerID') AS provider_id,
                 json_extract(m.data, '$.model.id') AS model_id,
@@ -76,13 +85,18 @@ function mapRows(rows: readonly SourceRow[]): CostRow[] {
       providerId: row.provider_id ?? UNKNOWN,
       modelId: row.model_id ?? UNKNOWN,
       kind: isStep ? "step" : "compaction",
-      failed: isStep ? false : row.status === "failed",
+      failed: isStep ? row.has_error === 1 : row.status === "failed",
       costMicros: usdToMicros(row.cost),
       tokens: {
         input: row.tokens_input ?? 0,
         cacheRead: row.tokens_cache_read ?? 0,
         cacheWrite: row.tokens_cache_write ?? 0,
       },
+      outputTokens: row.tokens_output ?? null,
+      reasoningTokens: row.tokens_reasoning ?? null,
+      // Mirrors the live recorder: a failed step has no finish reason.
+      finish: isStep && row.has_error === 0 ? (row.finish ?? null) : null,
+      directory: row.directory ?? null,
       createdAt: row.created ?? row.time_created,
     });
   }
@@ -172,4 +186,73 @@ export function runTokenFill(
     options.log(`token fill stopped, will retry next start: ${String(error)}`);
   }
   return filled;
+}
+
+interface DetailSourceRow {
+  id: string;
+  tokens_output: number | null;
+  tokens_reasoning: number | null;
+  finish: string | null;
+  has_error: number;
+  directory: string | null;
+}
+
+/**
+ * Fills output/reasoning tokens, finish reason, directory and (for imported steps) the failed flag of
+ * rows the detail fill has not handled yet. Each row is handled once, even when its source message
+ * is absent; unknown data stays NULL, never zero. A read failure writes nothing and the next start
+ * retries. Returns how many rows were handled.
+ */
+export function runDetailFill(
+  store: Store,
+  options: Pick<BackfillOptions, "sourcePath" | "cutoff" | "log">,
+): number {
+  let handled = 0;
+  try {
+    const ids = store.idsMissingDetails(options.cutoff);
+    if (ids.length === 0) return 0;
+    if (!existsSync(options.sourcePath))
+      throw new Error(`source database not found: ${options.sourcePath}`);
+    const db = new Database(options.sourcePath, { readonly: true });
+    try {
+      db.exec("PRAGMA busy_timeout = 5000");
+      for (let start = 0; start < ids.length; start += FILL_CHUNK_SIZE) {
+        const chunk = ids.slice(start, start + FILL_CHUNK_SIZE);
+        const found = new Map(
+          (
+            db
+              .query(
+                `SELECT m.id, s.directory,
+                        json_extract(m.data, '$.tokens.output') AS tokens_output,
+                        json_extract(m.data, '$.tokens.reasoning') AS tokens_reasoning,
+                        json_extract(m.data, '$.finish') AS finish,
+                        json_extract(m.data, '$.error') IS NOT NULL AS has_error
+                 FROM session_message m LEFT JOIN session_v2 s ON s.id = m.session_id
+                 WHERE m.id IN (${chunk.map(() => "?").join(",")})`,
+              )
+              .all(...chunk) as DetailSourceRow[]
+          ).map((row) => [row.id, row]),
+        );
+        handled += store.fillDetails(
+          chunk.map((id) => {
+            const row = found.get(id);
+            const errored = row?.has_error === 1;
+            return {
+              id,
+              outputTokens: row?.tokens_output ?? null,
+              reasoningTokens: row?.tokens_reasoning ?? null,
+              finish: row && !errored ? (row.finish ?? null) : null,
+              directory: row?.directory ?? null,
+              errored,
+            };
+          }),
+        );
+      }
+    } finally {
+      db.close();
+    }
+  } catch (error) {
+    options.log(`detail fill stopped, will retry next start: ${String(error)}`);
+  }
+  return handled;
 }

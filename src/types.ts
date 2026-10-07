@@ -20,6 +20,14 @@ export interface CostRow {
   readonly costMicros: number;
   /** Token counts for read-time pricing; null when the event carried no token data. */
   readonly tokens: TokenCounts | null;
+  /** Output tokens; null when unknown. */
+  readonly outputTokens: number | null;
+  /** Reasoning tokens; null when unknown. */
+  readonly reasoningTokens: number | null;
+  /** Finish reason of a completed step; null for failed steps, compactions and unknown. */
+  readonly finish: string | null;
+  /** Project directory the cost was incurred in; null when unknown. */
+  readonly directory: string | null;
   /** UTC epoch milliseconds. */
   readonly createdAt: number;
 }

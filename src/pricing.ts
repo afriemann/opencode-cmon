@@ -53,6 +53,18 @@ export function tokenCounts(value: unknown): TokenCounts {
   };
 }
 
+/** Output and reasoning counts of an event's token object; a missing sub-field counts as 0. */
+export function detailTokens(value: unknown): {
+  output: number;
+  reasoning: number;
+} {
+  const tokens = record(value);
+  return {
+    output: finiteOrZero(tokens?.output),
+    reasoning: finiteOrZero(tokens?.reasoning),
+  };
+}
+
 function isCopilotClaude(price: ModelPrice): boolean {
   if (price.providerId !== COPILOT_PROVIDER) return false;
   return price.family !== undefined
@@ -103,6 +115,36 @@ export function cacheWriteExtraMicros(
   const tier = selectTier(price.cost, tokens);
   if (!tier || tier.cache.write !== 0) return 0;
   return Math.round(tokens.cacheWrite * CACHE_WRITE_MULTIPLIER * tier.input);
+}
+
+/** Outcome of pricing one row's cache-write add-on. */
+export type AddOn =
+  | { readonly kind: "micros"; readonly micros: number }
+  | { readonly kind: "unknown"; readonly reason: "tokens" }
+  | {
+      readonly kind: "unknown";
+      readonly reason: "price";
+      readonly key: string;
+    };
+
+const NO_ADD_ON: AddOn = { kind: "micros", micros: 0 };
+
+/** The cache-write add-on of one row, or why it cannot be priced. One rounding per row. */
+export function rowAddOn(
+  row: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly tokens: TokenCounts | null;
+  },
+  catalog: PriceTable,
+): AddOn {
+  const key = priceKey(row.providerId, row.modelId);
+  const price = catalog.get(key);
+  if (!addOnApplies(row.providerId, row.modelId, price)) return NO_ADD_ON;
+  if (row.tokens === null) return { kind: "unknown", reason: "tokens" };
+  if (!price || price.cost.length === 0)
+    return { kind: "unknown", reason: "price", key };
+  return { kind: "micros", micros: cacheWriteExtraMicros(row.tokens, price) };
 }
 
 function parseTier(value: unknown): CostTier | undefined {

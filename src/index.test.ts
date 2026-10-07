@@ -3,6 +3,7 @@
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
+// spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,6 +39,12 @@ const WRITE_TOKENS = {
 };
 const MODEL = { providerID: "github-copilot", id: "claude-sonnet-4.6" };
 
+interface ToolLike {
+  name: string;
+  options: unknown;
+  execute: (input: unknown, context: { sessionID: string }) => Promise<unknown>;
+}
+
 interface Reply {
   totalMicros: number;
   agents: Array<{ agent: string; micros: number }>;
@@ -54,6 +61,12 @@ function fakeContext(
   } = {},
 ) {
   const emitted: unknown[] = [];
+  const registeredTools = new Map<string, ToolLike>();
+  let toolDisposals = 0;
+  const toolEditor = {
+    add: (tool: ToolLike) => void registeredTools.set(tool.name, tool),
+  };
+  const transforms: Array<(editor: typeof toolEditor) => void> = [];
   let summaryHandler: (input: unknown) => Promise<Reply> = async () => {
     throw new Error("rpc not registered");
   };
@@ -85,7 +98,16 @@ function fakeContext(
     },
     session: {
       get: async ({ sessionID }: { sessionID: string }) =>
-        sessionID === "ses_c" ? { parentID: "ses_p" } : {},
+        sessionID === "ses_c"
+          ? { parentID: "ses_p", location: { directory: "/work/app" } }
+          : {},
+    },
+    tool: {
+      transform: async (callback: (editor: typeof toolEditor) => void) => {
+        transforms.push(callback);
+        callback(toolEditor);
+        return { dispose: async () => void (toolDisposals += 1) };
+      },
     },
     model: {
       list: () => {
@@ -119,6 +141,10 @@ function fakeContext(
   return {
     ctx,
     emitted,
+    registeredTools,
+    transforms,
+    toolDisposals: () => toolDisposals,
+    toolEditor,
     summary: (from = 0, to = Date.now() + DAY_MS) =>
       summaryHandler({ from, to }),
     listCalls: () => listCalls,
@@ -134,7 +160,7 @@ function fakeContext(
 function createSource(path: string): void {
   const db = new Database(path, { create: true });
   db.exec(`
-    CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT);
+    CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT);
     CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
       seq INTEGER NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
   `);
@@ -206,6 +232,10 @@ const seedRow = (id: string, overrides: Record<string, unknown> = {}) => ({
   failed: false,
   costMicros: 100_000,
   tokens: null,
+  outputTokens: null,
+  reasoningTokens: null,
+  finish: null,
+  directory: null,
   createdAt: Date.now(),
   ...overrides,
 });
@@ -368,5 +398,78 @@ describe("plugin", () => {
     openGate();
     await settle();
     expect(emitted).toHaveLength(0);
+  });
+
+  describe("cost tools", () => {
+    test("Tools are registered", async () => {
+      const f = fakeContext();
+      await start(f.ctx);
+      expect([...f.registeredTools.keys()].sort()).toEqual([
+        "cost_hotspots",
+        "cost_report",
+      ]);
+      for (const tool of f.registeredTools.values())
+        expect(tool.options).toEqual({ namespace: "cmon", pinned: true });
+    });
+
+    test("No tools without a store", async () => {
+      const f = fakeContext();
+      (f.ctx.options as { dbPath: string }).dbPath = dir;
+      await start(f.ctx);
+      expect(f.registeredTools.size).toBe(0);
+      expect(f.transforms).toHaveLength(0);
+    });
+
+    test("Registration is replay-safe", async () => {
+      const f = fakeContext();
+      await start(f.ctx);
+      const [transform] = f.transforms;
+      expect(() => {
+        transform!(f.toolEditor);
+        transform!(f.toolEditor);
+      }).not.toThrow();
+      expect(f.registeredTools.size).toBe(2);
+    });
+
+    test("a tool reads the recorded cost", async () => {
+      const seed = new Store({ dbPath });
+      seed.upsertLive(seedRow("m1", { costMicros: 2_000_000 }));
+      seed.close();
+      const f = fakeContext();
+      await start(f.ctx);
+      const result = (await f.registeredTools
+        .get("cost_report")!
+        .execute({}, { sessionID: "ses_c" })) as {
+        output: { totalMicros: number };
+      };
+      expect(result.output.totalMicros).toBe(2_000_000);
+    });
+
+    test("current resolves through the session lookup", async () => {
+      const seed = new Store({ dbPath });
+      seed.upsertLive(seedRow("m1", { directory: "/work/app/x" }));
+      seed.upsertLive(seedRow("m2", { directory: "/elsewhere" }));
+      seed.close();
+      const f = fakeContext();
+      await start(f.ctx);
+      const result = (await f.registeredTools
+        .get("cost_report")!
+        .execute({ project: "current" }, { sessionID: "ses_c" })) as {
+        output: { totalMicros: number };
+      };
+      expect(result.output.totalMicros).toBe(100_000);
+    });
+
+    test("Calls after shutdown fail cleanly", async () => {
+      const f = fakeContext();
+      await start(f.ctx);
+      const tool = f.registeredTools.get("cost_report")!;
+      await cleanup?.();
+      cleanup = undefined;
+      expect(f.toolDisposals()).toBe(1);
+      await expect(tool.execute({}, { sessionID: "ses_c" })).rejects.toThrow(
+        "cost tracking stopped",
+      );
+    });
   });
 });

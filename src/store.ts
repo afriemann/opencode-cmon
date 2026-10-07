@@ -476,6 +476,40 @@ export class Store {
     return read.deferred();
   }
 
+  /**
+   * Milliseconds since the previous step of the same session for each row (null when none). The
+   * predecessor is looked up among all of the session's steps, so filters never lengthen a gap.
+   */
+  stepGaps(rows: readonly CostRow[]): Map<string, number | null> {
+    const gaps = new Map<string, number | null>();
+    const sessions = [...new Set(rows.map((row) => row.sessionId))];
+    const query = this.db.query(
+      "SELECT created_at FROM cost_entry WHERE session_id = $session AND kind = 'step' ORDER BY created_at",
+    );
+    const stepTimes = new Map<string, number[]>();
+    for (const session of sessions)
+      stepTimes.set(
+        session,
+        (query.all({ $session: session }) as Array<{ created_at: number }>).map(
+          (entry) => entry.created_at,
+        ),
+      );
+    for (const row of rows) {
+      const times = stepTimes.get(row.sessionId) ?? [];
+      // Largest step time strictly before this row (times are ascending).
+      let low = 0;
+      let high = times.length;
+      while (low < high) {
+        const mid = (low + high) >> 1;
+        if ((times[mid] ?? 0) < row.createdAt) low = mid + 1;
+        else high = mid;
+      }
+      const earlier = times[low - 1];
+      gaps.set(row.id, earlier === undefined ? null : row.createdAt - earlier);
+    }
+    return gaps;
+  }
+
   private totalsBy<T>(
     column: string,
     alias: string,

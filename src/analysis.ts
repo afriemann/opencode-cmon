@@ -20,6 +20,14 @@ export const FANOUT_MIN_CHILDREN = 5;
 export const GROWTH_MIN_STEPS = 5;
 /** Last-to-first input-side token ratio that counts as context growth. */
 export const GROWTH_RATIO = 3;
+/** Anthropic prompt-cache lifetime; a step after a longer pause rewrites the whole context. */
+export const CACHE_TTL_MS = 5 * 60 * 1000;
+/** Gaps below this are a continuous burst of steps. */
+export const FAST_GAP_MS = 60 * 1000;
+/** After an idle gap, a step reading less than this share of its input-side tokens from cache rewrote its context. */
+export const IDLE_REWRITE_MAX_READ_SHARE = 0.5;
+/** Gap buckets in display order. */
+const GAP_BUCKETS = ["first", "<1m", "1-5m", ">5m"] as const;
 /** Floor for the first step's input-side tokens in the growth ratio, so a tiny first step cannot inflate it. */
 export const GROWTH_BASELINE_TOKENS = 5_000;
 /** Most findings of one session- or step-level type. */
@@ -39,13 +47,16 @@ export interface Range {
   readonly to: number;
 }
 
-export type GroupBy = "agent" | "model" | "provider" | "session" | "day";
+export type GroupBy =
+  "agent" | "model" | "provider" | "session" | "day" | "gap";
 export type SortBy = "cost" | "steps" | "avgCost";
 
 export interface AnalysisInput {
   readonly rows: readonly CostRow[];
   /** Rows matching every filter but lacking a directory; used only with `projectFiltered`. */
   readonly unknownDirectory: readonly CostRow[];
+  /** Milliseconds since each row's previous step by row id; a missing or null entry means none. */
+  readonly gaps: ReadonlyMap<string, number | null>;
   readonly projectFiltered: boolean;
   readonly catalog: PriceTable;
   readonly range: Range;
@@ -215,7 +226,17 @@ export interface Report {
   readonly excluded?: { rows: number; micros: number };
 }
 
-function keyOf(row: CostRow, groupBy: GroupBy): string {
+function gapBucket(gap: number | null | undefined): string {
+  if (gap === null || gap === undefined) return "first";
+  if (gap < FAST_GAP_MS) return "<1m";
+  return gap <= CACHE_TTL_MS ? "1-5m" : ">5m";
+}
+
+function keyOf(
+  row: CostRow,
+  groupBy: GroupBy,
+  gaps: AnalysisInput["gaps"],
+): string {
   switch (groupBy) {
     case "agent":
       return row.agent;
@@ -227,6 +248,8 @@ function keyOf(row: CostRow, groupBy: GroupBy): string {
       return row.sessionId;
     case "day":
       return dateOf(row.createdAt);
+    case "gap":
+      return gapBucket(gaps.get(row.id));
   }
 }
 
@@ -284,20 +307,26 @@ export function buildReport(
   const priced = price(input.rows, input.catalog);
   const total = sum(priced.rows);
   const buckets = groupBy(priced.rows, (entry) =>
-    keyOf(entry.row, options.groupBy),
+    keyOf(entry.row, options.groupBy, input.gaps),
   );
   const metric = SORTS[options.sort];
   const all = [...buckets].map(([key, entries]) =>
     statsOf(key, entries, total),
   );
-  all.sort((a, b) => metric(b) - metric(a) || (a.key < b.key ? -1 : 1));
+  const bucketOrder = (key: string): number =>
+    (GAP_BUCKETS as readonly string[]).indexOf(key);
+  all.sort(
+    options.groupBy === "gap"
+      ? (a, b) => bucketOrder(a.key) - bucketOrder(b.key)
+      : (a, b) => metric(b) - metric(a) || (a.key < b.key ? -1 : 1),
+  );
   const kept = all.slice(0, options.limit);
   const rest = all.slice(options.limit);
   const groups = [...kept];
   if (rest.length > 0) {
     const restKeys = new Set(rest.map((g) => g.key));
     const entries = priced.rows.filter((e) =>
-      restKeys.has(keyOf(e.row, options.groupBy)),
+      restKeys.has(keyOf(e.row, options.groupBy, input.gaps)),
     );
     groups.push(statsOf("others", entries, total));
   }
@@ -323,6 +352,7 @@ export type FindingType =
   | "compaction_spend"
   | "subagent_fanout"
   | "input_growth"
+  | "idle_cache_rewrite"
   | "agent_model_mix";
 
 export interface Finding {
@@ -610,6 +640,37 @@ export function buildHotspots(input: AnalysisInput, limit: number): Hotspots {
       suggestion:
         "Context grows every step; compact earlier, split the task, or cut large tool outputs.",
       basis: `Sessions with at least ${GROWTH_MIN_STEPS} steps; ratio of input+cache-read tokens of the last step to the first (at least ${GROWTH_BASELINE_TOKENS}). A compaction resets context and lowers the ratio.`,
+    });
+  }
+
+  const rewrites = priced.rows.filter((e) => {
+    const gap = input.gaps.get(e.row.id);
+    const t = e.row.tokens;
+    if (e.row.kind !== "step" || t === null || gap == null) return false;
+    const side = t.input + t.cacheRead + t.cacheWrite;
+    return (
+      gap > CACHE_TTL_MS &&
+      side > 0 &&
+      t.cacheRead / side < IDLE_REWRITE_MAX_READ_SHARE
+    );
+  });
+  if (rewrites.length > 0) {
+    const written = rewrites.reduce(
+      (n, e) => n + (e.row.tokens?.cacheWrite ?? 0),
+      0,
+    );
+    add({
+      type: "idle_cache_rewrite",
+      scope: "all",
+      evidence: {
+        metric: "stepsAfterIdleGap",
+        value: `${rewrites.length} step(s), avg ${Math.round(written / rewrites.length)} cache-write tokens`,
+        threshold: CACHE_TTL_MS / 60_000,
+      },
+      attributableMicros: sum(rewrites),
+      suggestion:
+        "Pauses over 5 minutes let the prompt cache expire and the whole context is written again; compact or start a fresh session instead of resuming a large one after a break.",
+      basis: `Steps whose gap to the previous step in their session exceeds ${CACHE_TTL_MS / 60_000} minutes and that read under ${IDLE_REWRITE_MAX_READ_SHARE * 100}% of their input-side tokens from cache. The gap is between recorded step start times, so it includes tool run and thinking time; the provider's real cache expiry is not observable.`,
     });
   }
 

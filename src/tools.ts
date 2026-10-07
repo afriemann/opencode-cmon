@@ -22,6 +22,7 @@ const GROUP_BY: readonly GroupBy[] = [
   "provider",
   "session",
   "day",
+  "gap",
 ];
 const SORT_BY: readonly SortBy[] = ["cost", "steps", "avgCost"];
 const KINDS: readonly EntryKind[] = ["step", "compaction"];
@@ -30,7 +31,7 @@ const NAMESPACE = "cmon";
 
 export interface CostToolDeps {
   /** The live store; throws once cost tracking has stopped. */
-  readonly store: () => Pick<Store, "filteredRows">;
+  readonly store: () => Pick<Store, "filteredRows" | "stepGaps">;
   readonly catalog: () => PriceTable;
   /** Called when a result is incomplete so the price catalog can reload. */
   readonly onIncomplete: () => void;
@@ -108,6 +109,7 @@ async function loadInput(
   deps: CostToolDeps,
   raw: unknown,
   sessionID: string,
+  needGaps: (args: Record<string, unknown>) => boolean,
 ): Promise<{ args: Record<string, unknown>; input: AnalysisInput }> {
   const args = record(raw);
   const now = deps.now();
@@ -138,12 +140,16 @@ async function loadInput(
     ...optional("includeSubagents", includeSubagents),
     ...optional("project", project),
   };
-  const { rows, unknownDirectory } = deps.store().filteredRows(filter);
+  const store = deps.store();
+  const { rows, unknownDirectory } = store.filteredRows(filter);
   return {
     args,
     input: {
       rows,
       unknownDirectory,
+      gaps: needGaps(args)
+        ? store.stepGaps([...rows, ...unknownDirectory])
+        : new Map(),
       projectFiltered: project !== undefined,
       catalog: deps.catalog(),
       range,
@@ -158,7 +164,7 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
   return [
     {
       name: "cost_report",
-      description: `Report where opencode cost went: cost, share, steps, average cost per step, token counts, cache-read ratio and failed-step cost, grouped by agent (default), model, provider, session or day. Use it to find the biggest cost drivers. ${COMMON_DESCRIPTION}`,
+      description: `Report where opencode cost went: cost, share, steps, average cost per step, token counts, cache-read ratio and failed-step cost, grouped by agent (default), model, provider, session, day or gap (time since the session's previous step: first, <1m, 1-5m, >5m; includes tool run and thinking time; sort is ignored for gap). Use it to find the biggest cost drivers. ${COMMON_DESCRIPTION}`,
       input: {
         type: "object",
         properties: {
@@ -172,7 +178,12 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
       output,
       options,
       async execute(raw, context) {
-        const { args, input } = await loadInput(deps, raw, context.sessionID);
+        const { args, input } = await loadInput(
+          deps,
+          raw,
+          context.sessionID,
+          (a) => a.groupBy === "gap",
+        );
         const report = buildReport(input, {
           groupBy: choice(args, "groupBy", GROUP_BY) ?? "agent",
           sort: choice(args, "sort", SORT_BY) ?? "cost",
@@ -184,7 +195,7 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
     },
     {
       name: "cost_hotspots",
-      description: `Rank cost hotspots with evidence and suggestions for reducing them: expensive sessions and steps, low cache use, cache writes, failed or truncated steps, compactions, sub-agent fan-out, context growth and each agent's model mix. Attributable costs overlap, so do not add them up; suggestions are heuristics, not guarantees. ${COMMON_DESCRIPTION}`,
+      description: `Rank cost hotspots with evidence and suggestions for reducing them: expensive sessions and steps, low cache use, cache writes, failed or truncated steps, compactions, sub-agent fan-out, context growth, rewrites after idle pauses over 5 minutes and each agent's model mix. Attributable costs overlap, so do not add them up; suggestions are heuristics, not guarantees. ${COMMON_DESCRIPTION}`,
       input: {
         type: "object",
         properties: {
@@ -196,7 +207,12 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
       output,
       options,
       async execute(raw, context) {
-        const { args, input } = await loadInput(deps, raw, context.sessionID);
+        const { args, input } = await loadInput(
+          deps,
+          raw,
+          context.sessionID,
+          () => true,
+        );
         const hotspots = buildHotspots(
           input,
           validateLimit(numberArg(args), HOTSPOTS_MAX_LIMIT),

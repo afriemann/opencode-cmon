@@ -8,6 +8,7 @@
 // spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
 // spec: openspec/changes/add-cost-analysis-tools/specs/cost-recording/spec.md
 // spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
+// spec: openspec/changes/add-cache-gap-analysis/specs/cost-analysis/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -594,6 +595,51 @@ describe("store", () => {
       });
       store.upsertLive(full);
       expect(store.filteredRows(FILTER).rows).toEqual([full]);
+    });
+  });
+
+  describe("step gaps", () => {
+    const FILTER = { from: 0, to: 10_000_000 };
+
+    test("stepGaps measures the time to the previous step", () => {
+      const store = open();
+      store.upsertLive(row({ id: "a", createdAt: 1_000 }));
+      store.upsertLive(row({ id: "b", createdAt: 31_000 }));
+      const { rows } = store.filteredRows(FILTER);
+      expect(store.stepGaps(rows)).toEqual(
+        new Map([
+          ["a", null],
+          ["b", 30_000],
+        ]),
+      );
+    });
+
+    test("stepGaps ignores filters", () => {
+      const store = open();
+      store.upsertLive(row({ id: "a", agent: "x", createdAt: 1_000 }));
+      store.upsertLive(row({ id: "b", agent: "y", createdAt: 61_000 }));
+      store.upsertLive(row({ id: "c", agent: "x", createdAt: 121_000 }));
+      const { rows } = store.filteredRows({ ...FILTER, agent: "x" });
+      expect(store.stepGaps(rows).get("c")).toBe(60_000);
+    });
+
+    test("stepGaps skips compactions as predecessors", () => {
+      const store = open();
+      store.upsertLive(row({ id: "a", createdAt: 1_000 }));
+      store.upsertLive(
+        row({ id: "k", kind: "compaction", createdAt: 300_000 }),
+      );
+      store.upsertLive(row({ id: "b", createdAt: 601_000 }));
+      const { rows } = store.filteredRows(FILTER);
+      expect(store.stepGaps(rows).get("b")).toBe(600_000);
+    });
+
+    test("Gaps stay within a session", () => {
+      const store = open();
+      store.upsertLive(row({ id: "a", sessionId: "s1", createdAt: 1_000 }));
+      store.upsertLive(row({ id: "b", sessionId: "s2", createdAt: 5_000 }));
+      const { rows } = store.filteredRows(FILTER);
+      expect(store.stepGaps(rows).get("b")).toBeNull();
     });
   });
 

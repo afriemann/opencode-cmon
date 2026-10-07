@@ -1,4 +1,5 @@
 // spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
+// spec: openspec/changes/add-cache-gap-analysis/specs/cost-analysis/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -49,6 +50,11 @@ function tools(): Record<string, CostTool> {
     }).map((tool) => [tool.name, tool]),
   );
 }
+
+const keys = (result: { output: unknown }) =>
+  (result.output as { groups: Array<{ key: string }> }).groups.map(
+    (g) => g.key,
+  );
 
 const call = (name: string, input: unknown = {}) =>
   tools()[name]!.execute(input, { sessionID: "ses_caller" });
@@ -143,6 +149,34 @@ describe("cost tools", () => {
   test("Limit above the maximum is rejected", async () => {
     await expect(call("cost_report", { limit: 51 })).rejects.toThrow(/50/);
     await expect(call("cost_hotspots", { limit: 31 })).rejects.toThrow(/30/);
+  });
+
+  const day2 = new Date(2026, 9, 2).getTime();
+
+  test("Gaps ignore filters", async () => {
+    store.upsertLive(row({ id: "a", agent: "x", createdAt: day2 }));
+    store.upsertLive(row({ id: "b", agent: "y", createdAt: day2 + 60_000 }));
+    store.upsertLive(row({ id: "c", agent: "x", createdAt: day2 + 120_000 }));
+    const result = await call("cost_report", {
+      period: "2026-10",
+      agent: "x",
+      groupBy: "gap",
+    });
+    expect(keys(result)).toEqual(["first", "1-5m"]);
+  });
+
+  test("Compactions do not reset the gap", async () => {
+    store.upsertLive(row({ id: "a", createdAt: day2 }));
+    store.upsertLive(
+      row({ id: "k", kind: "compaction", createdAt: day2 + 300_000 }),
+    );
+    store.upsertLive(row({ id: "b", createdAt: day2 + 600_000 }));
+    const result = await call("cost_report", {
+      period: "2026-10",
+      kind: "step",
+      groupBy: "gap",
+    });
+    expect(keys(result)).toEqual(["first", ">5m"]);
   });
 
   test("an unknown groupBy is rejected", async () => {

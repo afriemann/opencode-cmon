@@ -1,4 +1,5 @@
 // spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
+// spec: openspec/changes/add-cache-gap-analysis/specs/cost-analysis/spec.md
 import { describe, expect, test } from "bun:test";
 import {
   buildHotspots,
@@ -56,6 +57,7 @@ function input(
   return {
     rows,
     unknownDirectory: [],
+    gaps: new Map(),
     projectFiltered: false,
     catalog: EMPTY,
     range: RANGE,
@@ -338,6 +340,61 @@ describe("buildReport", () => {
 
   test("no exclusion note without a project filter", () => {
     expect(report([row()]).excluded).toBeUndefined();
+  });
+});
+
+const MIN = 60_000;
+const gapsOf = (entries: Array<[CostRow, number | null]>) =>
+  new Map(entries.map(([r, g]) => [r.id, g]));
+
+describe("gap analysis", () => {
+  test("Group by gap uses fixed ordered buckets", () => {
+    const rows = [row(), row(), row(), row()];
+    const gaps = gapsOf([
+      [rows[0]!, null],
+      [rows[1]!, 30_000],
+      [rows[2]!, 3 * MIN],
+      [rows[3]!, 10 * MIN],
+    ]);
+    const result = report(rows, { groupBy: "gap" }, { gaps });
+    expect(result.groups.map((g) => [g.key, g.steps])).toEqual([
+      ["first", 1],
+      ["<1m", 1],
+      ["1-5m", 1],
+      [">5m", 1],
+    ]);
+  });
+
+  test("A step without a known predecessor is first", () => {
+    expect(report([row()], { groupBy: "gap" }).groups[0]?.key).toBe("first");
+  });
+
+  const idleRow = (overrides: Partial<CostRow> = {}) =>
+    row({
+      tokens: { input: 100, cacheRead: 100, cacheWrite: 200_000 },
+      ...overrides,
+    });
+  const idle = (rows: CostRow[], gap: number) =>
+    buildHotspots(
+      input(rows, { gaps: gapsOf(rows.map((r) => [r, gap])) }),
+      30,
+    ).findings.filter((f) => f.type === "idle_cache_rewrite");
+
+  test("Idle rewrite is reported", () => {
+    const found = idle([idleRow({ costMicros: 3_000_000 })], 10 * MIN);
+    expect(found[0]).toMatchObject({ attributableMicros: 3_000_000 });
+    expect(String(found[0]?.evidence.value)).toMatch(/1 step.*200000/s);
+  });
+
+  test("Short gaps are not reported", () => {
+    expect(idle([idleRow()], MIN)).toEqual([]);
+  });
+
+  test("Warm steps after a long gap are not reported", () => {
+    const warm = row({
+      tokens: { input: 100, cacheRead: 150_000, cacheWrite: 1_000 },
+    });
+    expect(idle([warm], 10 * MIN)).toEqual([]);
   });
 });
 

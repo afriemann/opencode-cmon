@@ -8,6 +8,7 @@ const CLAUDE_ID_PREFIX = "claude-";
 export interface CostTier {
   readonly tier?: { readonly type: "context"; readonly size: number };
   readonly input: number;
+  readonly output?: number;
   readonly cache: { readonly read: number; readonly write: number };
 }
 
@@ -16,6 +17,13 @@ export interface ModelPrice {
   readonly modelId: string;
   readonly family?: string;
   readonly cost: readonly CostTier[];
+}
+
+/** What opencode recorded for a row; lets the reader tell whether the cost already includes cache writes. */
+export interface RecordedCost {
+  readonly costMicros: number;
+  readonly outputTokens: number | null;
+  readonly reasoningTokens: number | null;
 }
 
 export interface TokenCounts {
@@ -104,17 +112,33 @@ export function selectTier(
 }
 
 /**
- * Extra micro-USD for cache-write tokens that opencode prices at zero. Prices are USD per million
- * tokens, so tokens x price is already micro-USD.
+ * Extra micro-USD for cache-write tokens that the recorded cost lacks. Prices are USD per million
+ * tokens, so tokens x price is already micro-USD. With the recorded cost known, the row lacks the
+ * charge when its cost is below the expected cost without cache writes plus half the add-on, so the
+ * decision does not depend on the catalog the reader happens to have now. Without it (unknown
+ * output or reasoning tokens, or no output price) the catalog's cache-write price decides.
  */
 export function cacheWriteExtraMicros(
   tokens: TokenCounts,
   price: ModelPrice | undefined,
+  recorded?: RecordedCost,
 ): number {
   if (!price || tokens.cacheWrite === 0 || !isCopilotClaude(price)) return 0;
   const tier = selectTier(price.cost, tokens);
-  if (!tier || tier.cache.write !== 0) return 0;
-  return Math.round(tokens.cacheWrite * CACHE_WRITE_MULTIPLIER * tier.input);
+  if (!tier) return 0;
+  const addOn = Math.round(tokens.cacheWrite * CACHE_WRITE_MULTIPLIER * tier.input);
+  if (
+    recorded?.outputTokens != null &&
+    recorded.reasoningTokens !== null &&
+    tier.output !== undefined
+  ) {
+    const expected =
+      tokens.input * tier.input +
+      tokens.cacheRead * tier.cache.read +
+      (recorded.outputTokens + recorded.reasoningTokens) * tier.output;
+    return recorded.costMicros < expected + addOn / 2 ? addOn : 0;
+  }
+  return tier.cache.write === 0 ? addOn : 0;
 }
 
 /** Outcome of pricing one row's cache-write add-on. */
@@ -135,6 +159,9 @@ export function rowAddOn(
     readonly providerId: string;
     readonly modelId: string;
     readonly tokens: TokenCounts | null;
+    readonly costMicros: number;
+    readonly outputTokens: number | null;
+    readonly reasoningTokens: number | null;
   },
   catalog: PriceTable,
 ): AddOn {
@@ -144,7 +171,7 @@ export function rowAddOn(
   if (row.tokens === null) return { kind: "unknown", reason: "tokens" };
   if (!price || price.cost.length === 0)
     return { kind: "unknown", reason: "price", key };
-  return { kind: "micros", micros: cacheWriteExtraMicros(row.tokens, price) };
+  return { kind: "micros", micros: cacheWriteExtraMicros(row.tokens, price, row) };
 }
 
 function parseTier(value: unknown): CostTier | undefined {
@@ -163,6 +190,7 @@ function parseTier(value: unknown): CostTier | undefined {
       ? { tier: { type: "context" as const, size: tier.size } }
       : {}),
     input: entry.input,
+    ...(typeof entry.output === "number" ? { output: entry.output } : {}),
     cache: { read, write: cache.write },
   };
 }

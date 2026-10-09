@@ -1,3 +1,4 @@
+// spec: openspec/changes/fix-cache-write-addon-per-row/specs/cost-display/spec.md
 // spec: openspec/changes/account-for-cache-writes/specs/cost-recording/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
 import { describe, expect, jest, test } from "bun:test";
@@ -6,6 +7,7 @@ import {
   createPriceLookup,
   addOnApplies,
   parseCatalog,
+  rowAddOn,
   selectTier,
   tokenCounts,
   type ModelPrice,
@@ -298,5 +300,98 @@ describe("PriceLookup", () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+describe("rowAddOn per-row cache-write decision", () => {
+  const priced = (write: number): ModelPrice => ({
+    ...SONNET,
+    cost: [{ input: 2, output: 10, cache: { read: 0.1, write } }],
+  });
+  const catalog = (write: number) =>
+    new Map([["github-copilot/claude-sonnet-5.5", priced(write)]]);
+  // 40,000 cache-write tokens -> add-on 100,000; 1,000 output tokens -> expected 10,000.
+  const row = (over: Record<string, unknown> = {}) => ({
+    providerId: "github-copilot",
+    modelId: "claude-sonnet-5.5",
+    tokens: counts(40_000),
+    costMicros: 10_000,
+    outputTokens: 1000,
+    reasoningTokens: 0,
+    ...over,
+  });
+
+  test("A non-zero catalog cache-write price does not drop the add-on", () => {
+    expect(rowAddOn(row(), catalog(2.5))).toEqual({
+      kind: "micros",
+      micros: 100_000,
+    });
+  });
+
+  test("A row that already includes cache writes gets no add-on", () => {
+    expect(rowAddOn(row({ costMicros: 110_000 }), catalog(0))).toEqual({
+      kind: "micros",
+      micros: 0,
+    });
+  });
+
+  test("applies below the midpoint and not at it", () => {
+    expect(rowAddOn(row({ costMicros: 59_999 }), catalog(0))).toEqual({
+      kind: "micros",
+      micros: 100_000,
+    });
+    expect(rowAddOn(row({ costMicros: 60_000 }), catalog(0))).toEqual({
+      kind: "micros",
+      micros: 0,
+    });
+  });
+
+  test("Unknown output tokens fall back to the catalog price", () => {
+    const unknown = row({ outputTokens: null });
+    expect(rowAddOn(unknown, catalog(0))).toEqual({
+      kind: "micros",
+      micros: 100_000,
+    });
+    expect(rowAddOn(unknown, catalog(2.5))).toEqual({
+      kind: "micros",
+      micros: 0,
+    });
+    expect(rowAddOn(row({ reasoningTokens: null }), catalog(2.5))).toEqual({
+      kind: "micros",
+      micros: 0,
+    });
+  });
+
+  test("a tier without an output price falls back to the catalog price", () => {
+    const noOutput = new Map([
+      [
+        "github-copilot/claude-sonnet-5.5",
+        { ...SONNET, cost: [{ input: 2, cache: { read: 0.1, write: 2.5 } }] },
+      ],
+    ]);
+    expect(rowAddOn(row(), noOutput)).toEqual({ kind: "micros", micros: 0 });
+  });
+
+  test("the tier output price is used in the per-row decision", () => {
+    const tiered = new Map([
+      [
+        "github-copilot/claude-sonnet-5.5",
+        {
+          ...SONNET,
+          cost: [
+            { input: 2, output: 10, cache: { read: 0.1, write: 0 } },
+            {
+              tier: { type: "context" as const, size: 200_000 },
+              input: 4,
+              output: 20,
+              cache: { read: 0.2, write: 0 },
+            },
+          ],
+        },
+      ],
+    ]);
+    // context 240,000 > 200,000: expected = 20,000 + 40,000*0 ; add-on = 40,000*1.25*4 = 200,000
+    const big = row({ tokens: counts(40_000, 200_000), costMicros: 800_000 + 20_000 });
+    expect(rowAddOn(big, tiered)).toEqual({ kind: "micros", micros: 200_000 });
   });
 });

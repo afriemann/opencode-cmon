@@ -65,4 +65,8 @@ export interface Candidate {
   readonly modelId: string;
   /** Null when the row's token counts are unknown. */
   readonly tokens: TokenCounts | null;
+  /** opencode's own cost for the step; tells whether it already includes cache writes. */
+  readonly costMicros: number;
+  readonly outputTokens: number | null;
+  readonly reasoningTokens: number | null;
 }

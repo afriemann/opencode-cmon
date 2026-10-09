@@ -1,3 +1,4 @@
+// spec: openspec/changes/fix-cache-write-addon-per-row/specs/cost-display/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
 // spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
 import { describe, expect, test } from "bun:test";
@@ -20,6 +21,9 @@ const candidate = (overrides: Partial<Candidate> = {}): Candidate => ({
   providerId: "github-copilot",
   modelId: "claude-sonnet-5.5",
   tokens: { input: 0, cacheRead: 0, cacheWrite: 1_725_111 },
+  costMicros: 0,
+  outputTokens: null,
+  reasoningTokens: null,
   ...overrides,
 });
 
@@ -32,21 +36,69 @@ const aggregate = (micros = 100_000) => ({
 describe("buildSummary", () => {
   test("Summary shows the corrected figure", () => {
     const result = buildSummary(
-      aggregate(),
-      [candidate({ tokens: { input: 0, cacheRead: 0, cacheWrite: 20_000 } })],
+      aggregate(10_000),
+      [
+        candidate({
+          tokens: { input: 0, cacheRead: 0, cacheWrite: 40_000 },
+          costMicros: 10_000,
+          outputTokens: 1_000,
+          reasoningTokens: 0,
+        }),
+      ],
       CATALOG,
     );
-    expect(result.totalMicros).toBe(100_000 + 50_000);
-    expect(result.agents).toEqual([{ agent: "build", micros: 150_000 }]);
+    expect(result.totalMicros).toBe(110_000);
+    expect(result.agents).toEqual([{ agent: "build", micros: 110_000 }]);
     expect(result.models).toEqual([
-      { model: "claude-sonnet-5.5", micros: 150_000 },
+      { model: "claude-sonnet-5.5", micros: 110_000 },
     ]);
     expect(result.providers).toEqual([
-      { provider: "github-copilot", micros: 150_000 },
+      { provider: "github-copilot", micros: 110_000 },
     ]);
     expect(result.complete).toBe(true);
   });
 
+  test("A non-zero catalog cache-write price does not drop the add-on", () => {
+    const paid = parseCatalog([
+      {
+        id: "claude-sonnet-5.5",
+        providerID: "github-copilot",
+        family: "claude-sonnet",
+        cost: [{ input: 2, output: 10, cache: { read: 0.1, write: 2.5 } }],
+      },
+    ]);
+    const result = buildSummary(
+      aggregate(1_238),
+      [
+        candidate({
+          tokens: { input: 0, cacheRead: 0, cacheWrite: 49_372 },
+          costMicros: 1_238,
+          outputTokens: 28,
+          reasoningTokens: 0,
+        }),
+      ],
+      paid,
+    );
+    expect(result.totalMicros).toBe(1_238 + 123_430);
+  });
+
+  test("A row that already includes cache writes gets no add-on", () => {
+    const result = buildSummary(
+      aggregate(110_000),
+      [
+        candidate({
+          tokens: { input: 0, cacheRead: 0, cacheWrite: 40_000 },
+          costMicros: 110_000,
+          outputTokens: 1_000,
+          reasoningTokens: 0,
+        }),
+      ],
+      CATALOG,
+    );
+    expect(result.totalMicros).toBe(110_000);
+  });
+
+  // The default candidate has unknown output tokens, so this uses the catalog-price fallback.
   test("Sonnet cache writes are priced", () => {
     const result = buildSummary(aggregate(0), [candidate()], CATALOG);
     expect(result.totalMicros).toBe(4_312_778);

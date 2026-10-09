@@ -1,3 +1,4 @@
+// spec: openspec/changes/fix-cache-write-addon-per-row/specs/cost-display/spec.md
 // spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
 // spec: openspec/changes/add-cache-gap-analysis/specs/cost-analysis/spec.md
 import { describe, expect, test } from "bun:test";
@@ -266,12 +267,12 @@ describe("buildReport", () => {
     });
   });
 
-  test("Same fixture, same total", () => {
+  test("Sidebar and cost report agree", () => {
     const rows = [
       row({
         providerId: "github-copilot",
         modelId: "claude-sonnet-5.5",
-        costMicros: 100_000,
+        costMicros: 100,
         tokens: { input: 0, cacheRead: 0, cacheWrite: 20_000 },
       }),
       row({ costMicros: 250_000 }),
@@ -283,10 +284,13 @@ describe("buildReport", () => {
         providerId: r.providerId,
         modelId: r.modelId,
         tokens: r.tokens,
+        costMicros: r.costMicros,
+        outputTokens: r.outputTokens,
+        reasoningTokens: r.reasoningTokens,
       }));
     const summary = buildSummary(
       {
-        agents: [{ agent: "build", micros: 350_000 }],
+        agents: [{ agent: "build", micros: 250_100 }],
         models: [],
         providers: [],
       },
@@ -295,7 +299,7 @@ describe("buildReport", () => {
     );
     const result = report(rows, {}, { catalog: CATALOG });
     expect(result.totalMicros).toBe(summary.totalMicros);
-    expect(result.totalMicros).toBe(400_000);
+    expect(result.totalMicros).toBe(300_100);
   });
 
   test("Incomplete pricing is flagged", () => {
@@ -487,6 +491,7 @@ describe("buildHotspots", () => {
       const writer = row({
         providerId: "github-copilot",
         modelId: "claude-sonnet-5.5",
+        costMicros: 100,
         tokens: { input: 0, cacheRead: 0, cacheWrite: 20_000 },
       });
       const found = ofType([writer], "cache_write_spend", { catalog: CATALOG });

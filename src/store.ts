@@ -550,7 +550,8 @@ export class Store {
       );
       const rows = this.db
         .query(
-          `SELECT agent, provider_id, model_id, tokens_input, tokens_cache_read, tokens_cache_write
+          `SELECT agent, provider_id, model_id, tokens_input, tokens_cache_read, tokens_cache_write,
+                  cost_micros, tokens_output, tokens_reasoning
            FROM cost_entry WHERE created_at >= $from AND created_at < $to
              AND provider_id = $provider
              AND (tokens_cache_write > 0 OR tokens_cache_write IS NULL)`,
@@ -562,6 +563,9 @@ export class Store {
         tokens_input: number | null;
         tokens_cache_read: number | null;
         tokens_cache_write: number | null;
+        cost_micros: number;
+        tokens_output: number | null;
+        tokens_reasoning: number | null;
       }>;
       const candidates = rows.map((row): Candidate => ({
         agent: row.agent,
@@ -575,6 +579,9 @@ export class Store {
                 cacheRead: row.tokens_cache_read ?? 0,
                 cacheWrite: row.tokens_cache_write,
               },
+        costMicros: row.cost_micros,
+        outputTokens: row.tokens_output,
+        reasoningTokens: row.tokens_reasoning,
       }));
       return { agents, models, providers, candidates };
     });

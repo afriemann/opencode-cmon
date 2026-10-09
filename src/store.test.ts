@@ -248,6 +248,21 @@ describe("store", () => {
     });
   });
 
+  describe("candidate pricing inputs", () => {
+    test("candidates carry the recorded cost and output tokens", () => {
+      const store = open();
+      store.upsertLive(
+        row({ costMicros: 1_238, outputTokens: 28, reasoningTokens: 5 }),
+      );
+      const { candidates } = store.summaryInputs(0, 10_000);
+      expect(candidates[0]).toMatchObject({
+        costMicros: 1_238,
+        outputTokens: 28,
+        reasoningTokens: 5,
+      });
+    });
+  });
+
   describe("token fill", () => {
     test("idsMissingTokens lists NULL-token rows since a cutoff", () => {
       const store = open();

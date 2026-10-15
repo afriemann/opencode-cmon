@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { usdToMicros } from "./money";
 import type { Store } from "./store";
+import type { StepAttribution } from "./recorder";
 import { COMPACTION_AGENT, UNKNOWN, type CostRow } from "./types";
 
 export interface BackfillOptions {
@@ -37,7 +39,7 @@ interface SourceRow {
 function readSourceRows(sourcePath: string, cutoff: number): SourceRow[] {
   const db = new Database(sourcePath, { readonly: true });
   try {
-    db.exec("PRAGMA busy_timeout = 5000");
+    db.run("PRAGMA busy_timeout = 5000");
     return db
       .query(
         `SELECT m.id, m.session_id, m.type, m.time_created, s.parent_id, s.directory,
@@ -122,6 +124,191 @@ export function runBackfill(store: Store, options: BackfillOptions): void {
 
 const FILL_CHUNK_SIZE = 500;
 
+const ATTRIBUTION_BUSY_TIMEOUT_MS = 50;
+
+export type AttributionFailure =
+  | "source-unavailable"
+  | "source-read"
+  | "source-invalid"
+  | "message-missing"
+  | "message-mismatch"
+  | "field-invalid"
+  | "ledger-write";
+type ReportAttributionFailure = (reason: AttributionFailure) => void;
+
+/** Only categorical data crosses this boundary; diagnostic sinks cannot affect accounting. */
+export function createAttributionDiagnostics(write: (line: string) => void): {
+  live: ReportAttributionFailure;
+  startupFailure: ReportAttributionFailure;
+  startupSummary: (repaired: number) => void;
+} {
+  const correlation = randomUUID();
+  const seen = new Set<AttributionFailure>();
+  const counts: Partial<Record<AttributionFailure, number>> = {};
+  let summarized = false;
+  const emit = (message: string, extra: object): void => {
+    try {
+      write(
+        JSON.stringify({
+          service: "opencode-cmon",
+          level: "warn",
+          message,
+          correlation,
+          ...extra,
+        }),
+      );
+    } catch {
+      /* Diagnostics must not interrupt recording or startup. */
+    }
+  };
+  return {
+    live(reason) {
+      if (seen.has(reason)) return;
+      seen.add(reason);
+      emit("attribution recovery unavailable", { reason, count: 1 });
+    },
+    startupFailure(reason) {
+      counts[reason] = (counts[reason] ?? 0) + 1;
+    },
+    startupSummary(repaired) {
+      if (summarized) return;
+      summarized = true;
+      if (repaired === 0 && Object.keys(counts).length === 0) return;
+      emit("attribution startup repair", { repaired, counts });
+    },
+  };
+}
+
+function withAttributionSource<T>(
+  sourcePath: string,
+  read: (db: Database) => T,
+): T {
+  const db = new Database(sourcePath, { readonly: true });
+  try {
+    db.run(`PRAGMA busy_timeout = ${ATTRIBUTION_BUSY_TIMEOUT_MS}`);
+    return read(db);
+  } finally {
+    db.close();
+  }
+}
+
+function readAttribution(
+  db: Database,
+  id: string,
+  sessionId: string,
+  report: ReportAttributionFailure,
+): StepAttribution | undefined {
+  const fields = ["agent", "model.providerID", "model.id"];
+  const row = db
+    .query(
+      `SELECT id, session_id, type, json_valid(data) AS valid,
+    ${fields.map((field, i) => `CASE WHEN json_valid(data) THEN CASE WHEN json_type(data, '$.${field}') = 'text' THEN json_extract(data, '$.${field}') END END AS field${i}`).join(",")}
+    FROM session_message WHERE id = $id`,
+    )
+    .get({ $id: id }) as {
+    id: string;
+    session_id: string;
+    type: string;
+    valid: number;
+    field0: string | null;
+    field1: string | null;
+    field2: string | null;
+  } | null;
+  if (!row) {
+    report("message-missing");
+    return undefined;
+  }
+  if (
+    row.id !== id ||
+    row.session_id !== sessionId ||
+    row.type !== "assistant"
+  ) {
+    report("message-mismatch");
+    return undefined;
+  }
+  if (!row.valid) {
+    report("source-invalid");
+    return undefined;
+  }
+  const result: { agent?: string; providerId?: string; modelId?: string } = {};
+  const values = [
+    ["agent", row.field0],
+    ["providerId", row.field1],
+    ["modelId", row.field2],
+  ] as const;
+  for (const [key, value] of values) {
+    if (typeof value === "string" && value.trim() !== "" && value !== UNKNOWN)
+      result[key] = value;
+    else report("field-invalid");
+  }
+  return result;
+}
+
+/** Exact-message evidence only; source failures never interrupt live accounting. */
+export function lookupAttribution(
+  sourcePath: string,
+  id: string,
+  sessionId: string,
+  report: ReportAttributionFailure = () => {},
+): StepAttribution | undefined {
+  try {
+    if (!existsSync(sourcePath)) {
+      report("source-unavailable");
+      return undefined;
+    }
+    return withAttributionSource(sourcePath, (db) =>
+      readAttribution(db, id, sessionId, report),
+    );
+  } catch {
+    report("source-read");
+    return undefined;
+  }
+}
+
+/** Retries retained unknown steps on every startup; source reads never hold the ledger write lock. */
+export function runAttributionFill(
+  store: Store,
+  options: Pick<BackfillOptions, "sourcePath" | "cutoff">,
+  report: ReportAttributionFailure = () => {},
+): number {
+  let filled = 0;
+  let phase: AttributionFailure = "ledger-write";
+  try {
+    let chunk = store.attributionCandidates(
+      options.cutoff,
+      "",
+      FILL_CHUNK_SIZE,
+    );
+    if (chunk.length === 0) return 0;
+    if (!existsSync(options.sourcePath)) {
+      report("source-unavailable");
+      return 0;
+    }
+    phase = "source-read";
+    withAttributionSource(options.sourcePath, (db) => {
+      while (chunk.length > 0) {
+        phase = "source-read";
+        const updates = chunk.map(({ id, sessionId }) => ({
+          id,
+          sessionId,
+          ...readAttribution(db, id, sessionId, report),
+        }));
+        phase = "ledger-write";
+        filled += store.fillAttribution(updates);
+        const after = chunk[chunk.length - 1]!.id;
+        chunk = store.attributionCandidates(
+          options.cutoff,
+          after,
+          FILL_CHUNK_SIZE,
+        );
+      }
+    });
+  } catch {
+    report(phase);
+  }
+  return filled;
+}
+
 interface TokenSourceRow {
   id: string;
   has_tokens: number;
@@ -149,7 +336,7 @@ export function runTokenFill(
       throw new Error(`source database not found: ${options.sourcePath}`);
     const db = new Database(options.sourcePath, { readonly: true });
     try {
-      db.exec("PRAGMA busy_timeout = 5000");
+      db.run("PRAGMA busy_timeout = 5000");
       for (let start = 0; start < ids.length; start += FILL_CHUNK_SIZE) {
         const chunk = ids.slice(start, start + FILL_CHUNK_SIZE);
         const found = new Map(
@@ -215,7 +402,7 @@ export function runDetailFill(
       throw new Error(`source database not found: ${options.sourcePath}`);
     const db = new Database(options.sourcePath, { readonly: true });
     try {
-      db.exec("PRAGMA busy_timeout = 5000");
+      db.run("PRAGMA busy_timeout = 5000");
       for (let start = 0; start < ids.length; start += FILL_CHUNK_SIZE) {
         const chunk = ids.slice(start, start + FILL_CHUNK_SIZE);
         const found = new Map(

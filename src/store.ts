@@ -60,6 +60,38 @@ const DETAIL_COLUMNS = [
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 const BACKFILL_MARKER = "backfill_done";
 
+export interface AttributionUpdate {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly agent?: string;
+  readonly providerId?: string;
+  readonly modelId?: string;
+}
+
+const ATTRIBUTION_FIELDS = [
+  ["agent", "$agent"],
+  ["provider_id", "$providerId"],
+  ["model_id", "$modelId"],
+] as const;
+const MERGE_ATTRIBUTION = `UPDATE cost_entry SET
+  ${ATTRIBUTION_FIELDS.map(([column, param]) => `${column} = CASE WHEN ${column} = 'unknown' THEN COALESCE(${param}, ${column}) ELSE ${column} END`).join(",")}
+  WHERE id = $id AND session_id = $sessionId AND kind = 'step' AND (
+  ${ATTRIBUTION_FIELDS.map(([column, param]) => `(${column} = 'unknown' AND ${param} IS NOT NULL)`).join(" OR ")})`;
+
+function attributionBindings(row: AttributionUpdate) {
+  const valid = (value: string | undefined): string | null =>
+    typeof value === "string" && value.trim() !== "" && value !== "unknown"
+      ? value
+      : null;
+  return {
+    $id: row.id,
+    $sessionId: row.sessionId,
+    $agent: valid(row.agent),
+    $providerId: valid(row.providerId),
+    $modelId: valid(row.modelId),
+  };
+}
+
 export function opencodeDataDir(
   env: Record<string, string | undefined> = process.env,
 ): string {
@@ -193,11 +225,11 @@ export class Store {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new Database(path, { create: true });
     try {
-      this.db.exec(
+      this.db.run(
         `PRAGMA busy_timeout = ${options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS}`,
       );
-      this.db.exec("PRAGMA journal_mode = WAL");
-      this.db.exec("PRAGMA synchronous = NORMAL");
+      this.db.run("PRAGMA journal_mode = WAL");
+      this.db.run("PRAGMA synchronous = NORMAL");
       this.migrate();
     } catch (error) {
       this.db.close();
@@ -238,7 +270,7 @@ export class Store {
     this.db
       .transaction(() => {
         for (const [name, type] of missing())
-          this.db.exec(`ALTER TABLE cost_entry ADD COLUMN ${name} ${type}`);
+          this.db.run(`ALTER TABLE cost_entry ADD COLUMN ${name} ${type}`);
       })
       .immediate();
   }
@@ -252,22 +284,22 @@ export class Store {
             `cmon.db schema version ${version} is newer than supported ${CURRENT_SCHEMA_VERSION}`,
           );
         }
-        if (version === 0) this.db.exec(SCHEMA);
+        if (version === 0) this.db.run(SCHEMA);
         else {
           if (version < 2) {
-            this.db.exec(
+            this.db.run(
               "ALTER TABLE cost_entry ADD COLUMN cache_write_extra_micros INTEGER NOT NULL DEFAULT 0",
             );
           }
           if (version < 3) {
             for (const column of TOKEN_COLUMNS) {
-              this.db.exec(
+              this.db.run(
                 `ALTER TABLE cost_entry ADD COLUMN ${column} INTEGER`,
               );
             }
           }
         }
-        this.db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
+        this.db.run(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
       })
       .immediate();
   }
@@ -277,11 +309,26 @@ export class Store {
     return this.revisionCounter;
   }
 
-  /**
-   * Records a live event. Overwrites a backfilled row or a live row that only had fallback
-   * attribution, but never degrades a correctly attributed live row (redelivery without `started`).
-   */
+  /** Existing steps merge unknown attribution only; compactions retain live replacement semantics. */
   upsertLive(row: CostRow): void {
+    if (row.kind === "step") {
+      const changed = this.db
+        .transaction(() => {
+          const inserted = this.db
+            .query(
+              `INSERT INTO cost_entry ${INSERT_COLUMNS} ON CONFLICT(id) DO NOTHING`,
+            )
+            .run(bindings(row, "live")).changes;
+          return (
+            inserted ||
+            this.db.query(MERGE_ATTRIBUTION).run(attributionBindings(row))
+              .changes
+          );
+        })
+        .immediate();
+      if (changed > 0) this.revisionCounter += 1;
+      return;
+    }
     this.db
       .query(
         `INSERT INTO cost_entry ${INSERT_COLUMNS}
@@ -298,7 +345,7 @@ export class Store {
            directory = COALESCE(excluded.directory, cost_entry.directory),
            details_checked = COALESCE(excluded.details_checked, cost_entry.details_checked),
            created_at = excluded.created_at, source = excluded.source
-         WHERE cost_entry.source = 'backfill' OR cost_entry.agent = 'unknown'`,
+          WHERE cost_entry.kind = 'compaction' AND (cost_entry.source = 'backfill' OR cost_entry.agent = 'unknown')`,
       )
       .run(bindings(row, "live"));
     this.revisionCounter += 1;
@@ -306,6 +353,40 @@ export class Store {
 
   isBackfillDone(): boolean {
     return this.getMeta(BACKFILL_MARKER) !== undefined;
+  }
+
+  /** Keyset pagination bounds retained unknown-step repair batches without a permanent skip marker. */
+  attributionCandidates(
+    since: number,
+    after: string,
+    limit: number,
+  ): Array<{ id: string; sessionId: string }> {
+    return this.db
+      .query(
+        `SELECT id, session_id AS sessionId FROM cost_entry
+      WHERE kind = 'step' AND created_at >= $since AND id > $after
+      AND (agent = 'unknown' OR provider_id = 'unknown' OR model_id = 'unknown')
+      ORDER BY id LIMIT $limit`,
+      )
+      .all({ $since: since, $after: after, $limit: limit }) as Array<{
+      id: string;
+      sessionId: string;
+    }>;
+  }
+
+  /** Rechecks each field under the write lock so stale evidence cannot overwrite another writer. */
+  fillAttribution(updates: readonly AttributionUpdate[]): number {
+    const update = this.db.query(MERGE_ATTRIBUTION);
+    const changed = this.db
+      .transaction(() => {
+        let count = 0;
+        for (const row of updates)
+          count += update.run(attributionBindings(row)).changes;
+        return count;
+      })
+      .immediate();
+    if (changed > 0) this.revisionCounter += 1;
+    return changed;
   }
 
   /**

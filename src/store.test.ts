@@ -176,11 +176,100 @@ describe("store", () => {
     expect(total(store)).toBe(100_000);
   });
 
+  // spec: openspec/changes/fix-unknown-attribution/specs/cost-retention/spec.md
   test("Live data wins over backfilled data", () => {
     const store = open();
     store.completeBackfill([row({ costMicros: 1 })]);
     store.upsertLive(row({ costMicros: 2 }));
-    expect(total(store)).toBe(2);
+    expect(total(store)).toBe(1);
+    store.completeBackfill([]);
+    store.upsertLive(
+      row({
+        id: "compaction",
+        kind: "compaction",
+        costMicros: 3,
+        agent: "unknown",
+      }),
+    );
+    store.upsertLive(
+      row({ id: "compaction", kind: "compaction", costMicros: 4 }),
+    );
+    expect(total(store)).toBe(5);
+  });
+
+  // spec: openspec/changes/fix-unknown-attribution/specs/cost-recording/spec.md
+  describe("step attribution merges", () => {
+    const snapshot = () => {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        return db
+          .query("SELECT * FROM cost_entry WHERE id='msg_1'")
+          .get() as Record<string, unknown>;
+      } finally {
+        db.close();
+      }
+    };
+    test.each(["providerId", "modelId"] as const)(
+      "Redelivery fills provider or model independently",
+      (field) => {
+        const store = open();
+        store.upsertLive(
+          row({
+            [field]: "unknown",
+            failed: true,
+            outputTokens: 23,
+            reasoningTokens: 7,
+            directory: "/work/synthetic",
+          }),
+        );
+        const before = snapshot();
+        store.upsertLive(
+          row({
+            agent: "conflict",
+            providerId: "new-provider",
+            modelId: "new-model",
+            costMicros: 999,
+            createdAt: 9000,
+            tokens: null,
+          }),
+        );
+        expect(snapshot()).toEqual({
+          ...before,
+          [field === "providerId" ? "provider_id" : "model_id"]:
+            field === "providerId" ? "new-provider" : "new-model",
+        });
+      },
+    );
+    test.each([false, true])(
+      "Incomplete redelivery never degrades a step",
+      (backfilled) => {
+        const store = open();
+        const original = row({
+          agent: "unknown",
+          modelId: "unknown",
+          failed: true,
+        });
+        if (backfilled) store.completeBackfill([original]);
+        else store.upsertLive(original);
+        const before = snapshot();
+        store.upsertLive(
+          row({
+            agent: "unknown",
+            providerId: "conflict",
+            modelId: "unknown",
+            costMicros: 888,
+            createdAt: 8000,
+          }),
+        );
+        expect(snapshot()).toEqual(before);
+        expect(() =>
+          store.upsertLive(
+            row({ id: "malformed", costMicros: null as unknown as number }),
+          ),
+        ).toThrow();
+        expect(snapshot()).toEqual(before);
+      },
+    );
   });
 
   test("backfill never overwrites an existing live row", () => {
@@ -318,13 +407,13 @@ describe("store", () => {
 
     function createOld(version: 1 | 2): void {
       const raw = new Database(dbPath, { create: true });
-      raw.exec(V1);
+      raw.run(V1);
       if (version === 2) {
-        raw.exec(
+        raw.run(
           "ALTER TABLE cost_entry ADD COLUMN cache_write_extra_micros INTEGER NOT NULL DEFAULT 0",
         );
       }
-      raw.exec(`PRAGMA user_version = ${version}`);
+      raw.run(`PRAGMA user_version = ${version}`);
       raw.close();
     }
 
@@ -411,8 +500,8 @@ describe("store", () => {
 
     function createV3(): void {
       const raw = new Database(dbPath, { create: true });
-      raw.exec(V3);
-      raw.exec("PRAGMA user_version = 3");
+      raw.run(V3);
+      raw.run("PRAGMA user_version = 3");
       raw.close();
     }
     const columns = (): string[] => {
@@ -458,7 +547,7 @@ describe("store", () => {
     test("An older plugin version still opens the upgraded file", () => {
       open().close();
       const raw = new Database(dbPath);
-      raw.exec(
+      raw.run(
         `INSERT INTO cost_entry (id, session_id, agent, provider_id, model_id, kind, failed, cost_micros, tokens_input, tokens_cache_read, tokens_cache_write, created_at, source)
          VALUES ('v3','s','a','p','m','step',0,5,1,2,3,100,'live')`,
       );
@@ -661,7 +750,7 @@ describe("store", () => {
   test("Newer schema is refused", () => {
     open().close();
     const raw = new Database(dbPath);
-    raw.exec("PRAGMA user_version = 99");
+    raw.run("PRAGMA user_version = 99");
     raw.close();
     expect(() => new Store({ dbPath })).toThrow();
   });

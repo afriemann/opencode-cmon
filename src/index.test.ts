@@ -4,13 +4,296 @@
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
 // spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
-import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  jest,
+  spyOn,
+  test,
+} from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plugin from "./index";
 import { Database } from "bun:sqlite";
 import { Store } from "./store";
+import { createAttributionDiagnostics } from "./backfill";
+
+const MODEL = { providerID: "github-copilot", id: "claude-sonnet-4.6" };
+
+// spec: openspec/changes/fix-unknown-attribution/specs/cost-recording/spec.md
+describe("exact persisted attribution", () => {
+  test("Failure diagnostics exclude source and identifying content", async () => {
+    const path = join(dir, "sensitive-path.db");
+    createSource(path);
+    const source = new Database(path);
+    source
+      .query("UPDATE session_message SET data=?")
+      .run("private-prompt credential-sentinel not-json");
+    source.close();
+    const ledger = new Store({ dbPath });
+    ledger.completeBackfill([]);
+    ledger.close();
+    queue.push({
+      id: "evt_sensitive",
+      type: "session.step.ended",
+      data: {
+        sessionID: "s",
+        assistantMessageID: "m1",
+        cost: 0.23,
+        tokens: TOKENS,
+      },
+    });
+    const lines: string[] = [];
+    const write = spyOn(process.stderr, "write").mockImplementation((line) => {
+      lines.push(String(line));
+      return true;
+    });
+    try {
+      await start(fakeContext({ sourceDbPath: path }).ctx);
+      await settle();
+    } finally {
+      write.mockRestore();
+    }
+    const entries = lines.map((line) => JSON.parse(line));
+    expect(entries.length).toBeGreaterThan(0);
+    expect(entries).toContainEqual(
+      expect.objectContaining({ reason: "source-invalid" }),
+    );
+    for (const entry of entries) {
+      expect(
+        Object.keys(entry).every((key) =>
+          [
+            "service",
+            "level",
+            "message",
+            "correlation",
+            "reason",
+            "count",
+            "counts",
+            "repaired",
+          ].includes(key),
+        ),
+      ).toBe(true);
+    }
+    expect(lines.join("")).not.toMatch(
+      /private-prompt|credential-sentinel|sensitive-path|m1|evt_sensitive|sessionID|sourcePath/,
+    );
+  });
+
+  test("Repeated failures do not flood diagnostics", async () => {
+    const quiet: string[] = [];
+    createAttributionDiagnostics((line) => quiet.push(line)).startupSummary(0);
+    expect(quiet).toEqual([]);
+    const path = join(dir, "source.db");
+    createSource(path);
+    const source = new Database(path);
+    source.run("UPDATE session_message SET data='invalid'");
+    source.close();
+    const ledger = new Store({ dbPath });
+    ledger.completeBackfill([
+      seedRow("m1", {
+        agent: "unknown",
+        tokens: { input: 1, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: 1,
+        directory: "/work/synthetic",
+      }),
+    ]);
+    ledger.close();
+    for (let n = 0; n < 20; n += 1)
+      queue.push({
+        id: `evt_${n}`,
+        type: "session.step.ended",
+        data: {
+          sessionID: "s",
+          assistantMessageID: "m1",
+          cost: 0.1,
+          tokens: TOKENS,
+        },
+      });
+    const entries: Array<Record<string, unknown>> = [];
+    const ledgerErrors: string[] = [];
+    const persist = spyOn(Store.prototype, "upsertLive").mockImplementationOnce(
+      () => {
+        throw new Error("synthetic ledger write failure");
+      },
+    );
+    const write = spyOn(process.stderr, "write").mockImplementation((line) => {
+      if (String(line).includes("failed to record session.step.ended")) {
+        ledgerErrors.push(String(line));
+        throw new Error("synthetic stderr failure");
+      }
+      const entry = JSON.parse(String(line));
+      entries.push(entry);
+      // A failing diagnostic sink must not stop startup or event recording.
+      throw new Error("synthetic stderr failure");
+    });
+    try {
+      const fake = fakeContext({ sourceDbPath: path });
+      await start(fake.ctx);
+      await settle();
+      expect((await fake.summary()).totalMicros).toBe(100_000);
+      expect(persist).toHaveBeenCalledTimes(20);
+    } finally {
+      write.mockRestore();
+      persist.mockRestore();
+    }
+    expect(
+      entries.filter((entry) => entry.reason === "source-invalid"),
+    ).toHaveLength(1);
+    expect(
+      entries.filter((entry) => entry.reason === "ledger-write"),
+    ).toHaveLength(1);
+    expect(ledgerErrors).toHaveLength(1);
+    expect(
+      entries.filter((entry) => entry.message === "attribution startup repair"),
+    ).toHaveLength(1);
+  });
+  test("Startup repairs missing fields without changing accounting", async () => {
+    const path = join(dir, "source.db");
+    createSource(path);
+    const ledger = new Store({ dbPath });
+    ledger.completeBackfill([
+      seedRow("m1", {
+        agent: "unknown",
+        providerId: "unknown",
+        modelId: "unknown",
+        costMicros: 234_567,
+        tokens: { input: 7, cacheRead: 8, cacheWrite: 0 },
+      }),
+    ]);
+    const before = ledger.filteredRows({ from: 0, to: Date.now() + DAY_MS })
+      .rows[0];
+    ledger.close();
+    if (!before) throw new Error("synthetic seed row missing");
+    const fake = fakeContext({ sourceDbPath: path });
+    await start(fake.ctx);
+    const summary = await fake.summary();
+    expect(summary.agents).toEqual([{ agent: "build", micros: 234_567 }]);
+    const check = new Store({ dbPath });
+    try {
+      expect(
+        check.filteredRows({ from: 0, to: Date.now() + DAY_MS }).rows[0],
+      ).toEqual({
+        ...before,
+        agent: "build",
+        providerId: MODEL.providerID,
+        modelId: MODEL.id,
+        // Existing independent token/detail fills still enrich their own missing fields.
+        outputTokens: 1,
+        reasoningTokens: 0,
+      });
+    } finally {
+      check.close();
+    }
+  });
+  test.each([
+    [
+      "Recovers a completed step without its start",
+      "s",
+      "assistant",
+      { agent: "build", model: MODEL },
+      "build",
+      MODEL.providerID,
+      MODEL.id,
+      "m1",
+    ],
+    [
+      "Rejects source identity or type mismatch",
+      "other",
+      "assistant",
+      { agent: "build", model: MODEL },
+      "unknown",
+      "unknown",
+      "unknown",
+      "m1",
+    ],
+    [
+      "Rejects source identity or type mismatch",
+      "s",
+      "compaction",
+      { agent: "build", model: MODEL },
+      "unknown",
+      "unknown",
+      "unknown",
+      "m1",
+    ],
+    [
+      "Rejects source identity or type mismatch",
+      "s",
+      "assistant",
+      { agent: "build", model: MODEL },
+      "unknown",
+      "unknown",
+      "unknown",
+      "different",
+    ],
+    ...[undefined, 42, "   ", "unknown"].map(
+      (invalid) =>
+        [
+          "Recovers only valid source fields",
+          "s",
+          "assistant",
+          {
+            agent: invalid,
+            model: { providerID: MODEL.providerID, id: invalid },
+          },
+          "unknown",
+          MODEL.providerID,
+          "unknown",
+          "m1",
+        ] as const,
+    ),
+  ])(
+    "%s",
+    async (
+      _title,
+      session,
+      type,
+      data,
+      agent,
+      providerId,
+      modelId,
+      messageId,
+    ) => {
+      const path = join(dir, "source.db");
+      createSource(path);
+      const source = new Database(path);
+      source
+        .query("UPDATE session_message SET session_id=?, type=?, data=?")
+        .run(session, type, JSON.stringify(data));
+      source.close();
+      const ledger = new Store({ dbPath });
+      ledger.completeBackfill([]);
+      ledger.close();
+      queue.push({
+        id: "evt_end",
+        type: "session.step.ended",
+        data: {
+          sessionID: "s",
+          assistantMessageID: messageId,
+          cost: 0.23,
+          tokens: TOKENS,
+        },
+      });
+      const fake = fakeContext({ sourceDbPath: path });
+      await start(fake.ctx);
+      await settle();
+      const check = new Store({ dbPath });
+      try {
+        expect(
+          check.filteredRows({ from: 0, to: Date.now() + DAY_MS }).rows,
+        ).toMatchObject([
+          { id: messageId, agent, providerId, modelId, costMicros: 230_000 },
+        ]);
+      } finally {
+        check.close();
+      }
+    },
+  );
+});
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TOKENS = {
@@ -37,7 +320,6 @@ const WRITE_TOKENS = {
   reasoning: 0,
   cache: { read: 0, write: 1_000_000 },
 };
-const MODEL = { providerID: "github-copilot", id: "claude-sonnet-4.6" };
 
 interface ToolLike {
   name: string;
@@ -159,7 +441,7 @@ function fakeContext(
 
 function createSource(path: string): void {
   const db = new Database(path, { create: true });
-  db.exec(`
+  db.run(`
     CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT);
     CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
       seq INTEGER NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);

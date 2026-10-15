@@ -1,5 +1,12 @@
 import { Plugin } from "@opencode/plugin";
-import { runBackfill, runDetailFill, runTokenFill } from "./backfill";
+import {
+  createAttributionDiagnostics,
+  lookupAttribution,
+  runAttributionFill,
+  runBackfill,
+  runDetailFill,
+  runTokenFill,
+} from "./backfill";
 import { createPriceLookup } from "./pricing";
 import { createRecorder, type CostEvent } from "./recorder";
 import { CostRpc } from "./rpc";
@@ -80,9 +87,18 @@ export default Plugin.define({
     lookup.refresh("updated");
 
     const cutoff = () => retentionCutoff(new Date());
+    const attributionDiagnostics = createAttributionDiagnostics((line) => {
+      process.stderr.write(`${line}\n`);
+    });
     runBackfill(store, { sourcePath, cutoff: cutoff(), log });
     runTokenFill(store, { sourcePath, cutoff: cutoff(), log });
     runDetailFill(store, { sourcePath, cutoff: cutoff(), log });
+    const repaired = runAttributionFill(
+      store,
+      { sourcePath, cutoff: cutoff() },
+      attributionDiagnostics.startupFailure,
+    );
+    attributionDiagnostics.startupSummary(repaired);
     store.prune(cutoff());
 
     registration.current = await ctx.rpc.register(CostRpc, {
@@ -134,6 +150,13 @@ export default Plugin.define({
     pruneTimer.unref();
 
     const recorder = createRecorder({
+      resolveAttribution: (id, sessionId) =>
+        lookupAttribution(
+          sourcePath,
+          id,
+          sessionId,
+          attributionDiagnostics.live,
+        ),
       resolveSession: async (sessionID) => {
         const session = (await ctx.session.get({ sessionID })) as {
           parentID?: string;
@@ -160,11 +183,21 @@ export default Plugin.define({
             }
             const row = await recorder.handle(event as CostEvent);
             if (row) {
-              store.upsertLive(row);
+              try {
+                store.upsertLive(row);
+              } catch (error) {
+                if (row.kind === "step")
+                  attributionDiagnostics.live("ledger-write");
+                throw error;
+              }
               scheduleNotify();
             }
           } catch (error) {
-            log(`failed to record ${event.type}: ${String(error)}`);
+            try {
+              log(`failed to record ${event.type}: ${String(error)}`);
+            } catch {
+              /* A failed diagnostic sink must not stop the event stream. */
+            }
           }
         }
       } catch (error) {

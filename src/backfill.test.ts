@@ -1,13 +1,20 @@
 // spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
 // spec: openspec/changes/add-cost-analysis-tools/specs/cost-retention/spec.md
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { runBackfill, runDetailFill, runTokenFill } from "./backfill";
+import {
+  lookupAttribution,
+  runAttributionFill,
+  runBackfill,
+  runDetailFill,
+  runTokenFill,
+} from "./backfill";
 import { Store } from "./store";
+import type { CostRow } from "./types";
 
 const TOKENS = {
   input: 1,
@@ -33,7 +40,7 @@ const WRITE_TOKENS = {
 
 function createSource(): Database {
   const db = new Database(sourcePath, { create: true });
-  db.exec(`
+  db.run(`
     CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT);
     CREATE TABLE session_message (
       id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
@@ -73,6 +80,182 @@ beforeEach(() => {
 afterEach(() => {
   store.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+// spec: openspec/changes/fix-unknown-attribution/specs/cost-recording/spec.md
+describe("attribution repair", () => {
+  const unknownStep = (
+    id = "msg_1",
+    overrides: Partial<CostRow> = {},
+  ): CostRow => ({
+    id,
+    sessionId: "ses_1",
+    parentSessionId: "parent",
+    agent: "unknown",
+    providerId: "unknown",
+    modelId: "unknown",
+    kind: "step",
+    failed: true,
+    costMicros: 12345,
+    tokens: { input: 3, cacheRead: 4, cacheWrite: 5 },
+    outputTokens: 6,
+    reasoningTokens: 7,
+    finish: "stop",
+    directory: "/work/synthetic",
+    createdAt: NOW,
+    ...overrides,
+  });
+  const persisted = (db: Database, id = "msg_1") =>
+    addMessage(db, id, "ses_1", "assistant", NOW, {
+      agent: "engineer",
+      model: MODEL,
+    });
+  const snapshot = () => {
+    const db = new Database(join(dir, "cmon.db"), { readonly: true });
+    try {
+      return db.query("SELECT * FROM cost_entry ORDER BY id").all() as Array<
+        Record<string, unknown>
+      >;
+    } finally {
+      db.close();
+    }
+  };
+  const fill = () => runAttributionFill(store, { sourcePath, cutoff: CUTOFF });
+
+  test("Startup repairs missing fields without changing accounting", () => {
+    const source = createSource();
+    persisted(source);
+    source.close();
+    store.upsertLive(unknownStep("msg_1", { agent: "known" }));
+    const before = snapshot()[0];
+    const revision = store.revision();
+    expect(fill()).toBe(1);
+    expect(snapshot()).toEqual([
+      { ...before, provider_id: MODEL.providerID, model_id: MODEL.id },
+    ]);
+    expect(store.revision()).toBe(revision + 1);
+  });
+  test("Startup repair is idempotent and excludes compactions", () => {
+    const source = createSource();
+    persisted(source);
+    persisted(source, "compaction");
+    persisted(source, "old");
+    source.close();
+    store.upsertLive(unknownStep());
+    store.upsertLive(unknownStep("compaction", { kind: "compaction" }));
+    store.upsertLive(unknownStep("old", { createdAt: CUTOFF - 1 }));
+    expect(fill()).toBe(1);
+    const before = snapshot();
+    const revision = store.revision();
+    expect(fill()).toBe(0);
+    expect(snapshot()).toEqual(before);
+    expect(store.revision()).toBe(revision);
+  });
+  test("Unresolved startup candidates remain retryable", () => {
+    store.upsertLive(unknownStep());
+    const before = snapshot();
+    expect(fill()).toBe(0);
+    expect(snapshot()).toEqual(before);
+    const source = createSource();
+    persisted(source);
+    source.close();
+    expect(fill()).toBe(1);
+    expect(snapshot()[0]).toMatchObject({
+      agent: "engineer",
+      model_id: MODEL.id,
+    });
+  });
+  test("Concurrent attribution writes preserve known values", () => {
+    store.upsertLive(unknownStep());
+    const candidate = store.attributionCandidates(CUTOFF, "", 500)[0]!;
+    const other = new Store({ dbPath: join(dir, "cmon.db") });
+    try {
+      other.fillAttribution([{ ...candidate, agent: "concurrent" }]);
+      const before = snapshot()[0];
+      expect(
+        store.fillAttribution([
+          {
+            ...candidate,
+            agent: "stale",
+            providerId: "provider",
+            modelId: "model",
+          },
+        ]),
+      ).toBe(1);
+      expect(snapshot()).toEqual([
+        { ...before, provider_id: "provider", model_id: "model" },
+      ]);
+      expect(
+        store.fillAttribution([
+          { ...candidate, sessionId: "wrong", agent: "wrong" },
+        ]),
+      ).toBe(0);
+    } finally {
+      other.close();
+    }
+  });
+  test("A failed repair batch preserves completed work", () => {
+    const reasons: string[] = [];
+    const candidates = spyOn(
+      store,
+      "attributionCandidates",
+    ).mockImplementationOnce(() => {
+      throw new Error("synthetic ledger failure");
+    });
+    try {
+      expect(
+        runAttributionFill(store, { sourcePath, cutoff: CUTOFF }, (reason) =>
+          reasons.push(reason),
+        ),
+      ).toBe(0);
+      expect(reasons).toEqual(["ledger-write"]);
+    } finally {
+      candidates.mockRestore();
+    }
+    const source = createSource();
+    for (let n = 0; n < 501; n += 1) {
+      const id = `msg_${String(n).padStart(4, "0")}`;
+      store.upsertLive(unknownStep(id));
+      persisted(source, id);
+    }
+    source.close();
+    const ledger = new Database(join(dir, "cmon.db"));
+    ledger.run(
+      "CREATE TRIGGER reject_last BEFORE UPDATE ON cost_entry WHEN OLD.id='msg_0500' BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END",
+    );
+    try {
+      expect(fill()).toBe(500);
+      expect(store.attributionCandidates(CUTOFF, "", 500)).toEqual([
+        { id: "msg_0500", sessionId: "ses_1" },
+      ]);
+      ledger.run("DROP TRIGGER reject_last");
+      expect(fill()).toBe(1);
+    } finally {
+      ledger.close();
+    }
+  });
+  test("Source failures preserve step accounting", () => {
+    expect(lookupAttribution(sourcePath, "msg_1", "ses_1")).toBeUndefined();
+    const source = createSource();
+    persisted(source);
+    source.run("BEGIN EXCLUSIVE");
+    try {
+      expect(lookupAttribution(sourcePath, "msg_1", "ses_1")).toBeUndefined();
+    } finally {
+      source.run("ROLLBACK");
+    }
+    source.query("UPDATE session_message SET data='not json'").run();
+    expect(lookupAttribution(sourcePath, "msg_1", "ses_1")).toBeUndefined();
+    source
+      .query("UPDATE session_message SET data=?")
+      .run(JSON.stringify({ agent: "engineer", model: MODEL }));
+    expect(lookupAttribution(sourcePath, "msg_1", "ses_1")).toEqual({
+      agent: "engineer",
+      providerId: MODEL.providerID,
+      modelId: MODEL.id,
+    });
+    source.close();
+  });
 });
 
 describe("backfill", () => {
@@ -213,7 +396,7 @@ describe("backfill", () => {
 
   test("Schema mismatch fails soft", () => {
     const db = new Database(sourcePath, { create: true });
-    db.exec("CREATE TABLE unrelated (x INTEGER)");
+    db.run("CREATE TABLE unrelated (x INTEGER)");
     db.close();
     expect(() =>
       runBackfill(store, {
@@ -342,7 +525,7 @@ describe("backfill", () => {
       expect(tokensOf("m1")).toEqual({ i: null, r: null, w: null });
       expect(logs).toHaveLength(1);
       const bad = new Database(sourcePath, { create: true });
-      bad.exec("CREATE TABLE unrelated (x INTEGER)");
+      bad.run("CREATE TABLE unrelated (x INTEGER)");
       bad.close();
       expect(runTokenFill(store, options())).toBe(0);
       expect(tokensOf("m1")).toEqual({ i: null, r: null, w: null });

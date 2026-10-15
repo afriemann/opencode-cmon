@@ -15,10 +15,18 @@ export interface SessionInfo {
   readonly directory: string | null;
 }
 
+export type StepAttribution = Partial<
+  Pick<CostRow, "agent" | "providerId" | "modelId">
+>;
+
 export interface RecorderDeps {
   /** Parent session ID (null for a top-level session) and directory (null when unknown). */
   readonly resolveSession: (sessionID: string) => Promise<SessionInfo>;
   readonly now: () => number;
+  readonly resolveAttribution?: (
+    id: string,
+    sessionId: string,
+  ) => StepAttribution | undefined;
 }
 
 export interface Recorder {
@@ -100,7 +108,14 @@ export function createRecorder(deps: RecorderDeps): Recorder {
     if (data.tokens === undefined || data.tokens === null) return null;
     const own = steps.get(id);
     steps.delete(id);
-    const state = own ?? lastStep.get(sessionId);
+    let state: StepAttribution | undefined = own;
+    if (!own) {
+      try {
+        state = deps.resolveAttribution?.(id, sessionId);
+      } catch {
+        // Recovery is best-effort; cost accounting must survive unavailable evidence.
+      }
+    }
     const session = await sessionOf(sessionId);
     return {
       id,

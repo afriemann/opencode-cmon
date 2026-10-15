@@ -1,4 +1,4 @@
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-recording/spec.md
+// spec: openspec/changes/fix-unknown-attribution/specs/cost-recording/spec.md
 // spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
 // spec: openspec/changes/add-cost-analysis-tools/specs/cost-recording/spec.md
 import { describe, expect, test } from "bun:test";
@@ -84,7 +84,7 @@ describe("recorder", () => {
     });
   });
 
-  test("Missing step start falls back to the last known agent, then unknown", async () => {
+  test("Missing step start falls back", async () => {
     const r = recorder();
     expect(await r.handle(ended("ses_1", "msg_x", 0.01))).toMatchObject({
       agent: "unknown",
@@ -93,7 +93,77 @@ describe("recorder", () => {
     await r.handle(started("ses_1", "msg_a", "build"));
     await r.handle(ended("ses_1", "msg_a", 0.01));
     expect(await r.handle(ended("ses_1", "msg_y", 0.01))).toMatchObject({
+      agent: "unknown",
+      providerId: "unknown",
+      modelId: "unknown",
+    });
+  });
+
+  test.each([
+    [
+      "Recovers a completed step without its start",
+      "session.step.ended",
+      false,
+    ],
+    [
+      "Recovers an eligible failed step without its start",
+      "session.step.failed",
+      true,
+    ],
+  ])("%s", async (_title, type, failed) => {
+    const r = createRecorder({
+      resolveSession: async () => ({ parentId: null, directory: null }),
+      now: () => 9_999,
+      resolveAttribution: (id: string, sessionId: string) => {
+        expect([id, sessionId]).toEqual(["msg_1", "ses_1"]);
+        return { agent: "engineer", providerId: "provider", modelId: "model" };
+      },
+    });
+    expect(
+      await r.handle({ ...ended("ses_1", "msg_1", 0.0123), type }),
+    ).toMatchObject({
+      agent: "engineer",
+      providerId: "provider",
+      modelId: "model",
+      costMicros: 12_300,
+      tokens: { input: 1, cacheRead: 0, cacheWrite: 0 },
+      createdAt: 9_999,
+      failed,
+    });
+  });
+
+  test("Observed matching start remains authoritative", async () => {
+    let lookups = 0;
+    const r = createRecorder({
+      resolveSession: async () => ({ parentId: null, directory: null }),
+      now: () => 9_999,
+      resolveAttribution: () => {
+        lookups += 1;
+        return { agent: "other" };
+      },
+    });
+    await r.handle(started("ses_1", "msg_1", "build"));
+    expect(await r.handle(ended("ses_1", "msg_1", 0.01))).toMatchObject({
       agent: "build",
+      createdAt: 5_000,
+    });
+    expect(lookups).toBe(0);
+  });
+
+  test("Source failures preserve step accounting", async () => {
+    const r = createRecorder({
+      resolveSession: async () => ({ parentId: null, directory: null }),
+      now: () => 9_999,
+      resolveAttribution: () => {
+        throw new Error("private source error");
+      },
+    });
+    expect(await r.handle(ended("ses_1", "msg_1", 0.0123))).toMatchObject({
+      agent: "unknown",
+      providerId: "unknown",
+      modelId: "unknown",
+      costMicros: 12_300,
+      createdAt: 9_999,
     });
   });
 

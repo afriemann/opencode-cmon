@@ -34,14 +34,14 @@ The plugin SHALL, until a backfill marker is set, import assistant and compactio
 #### Scenario: Second start does not re-import
 
 - **GIVEN** the marker is set
-- **WHEN** the plugin starts again
-- **THEN** `opencode.db` is not read
+- **WHEN** startup considers the one-time history import
+- **THEN** history is not re-imported; independent missing-field repair passes may still read the source
 
 #### Scenario: Live data wins over backfilled data
 
 - **GIVEN** a backfilled row for message `m1`
 - **WHEN** a live event for `m1` is recorded
-- **THEN** the row reflects the live values
+- **THEN** an existing step keeps its accounting, timestamps and known attribution and merges valid live attribution only into unknown fields; a compaction retains live-value replacement behavior
 
 #### Scenario: Simultaneous starts import once
 

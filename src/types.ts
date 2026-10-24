@@ -58,6 +58,63 @@ export interface Summary {
   readonly complete: boolean;
 }
 
+/**
+ * The five stored token categories. They are disjoint, so a complete row's usage is their sum.
+ * `null` means the ledger does not know that count; a known zero is not the same as unknown.
+ */
+export interface TokenComponents {
+  readonly input: number | null;
+  readonly cacheRead: number | null;
+  readonly cacheWrite: number | null;
+  readonly output: number | null;
+  readonly reasoning: number | null;
+}
+
+/** One retained row's lossless token counts and attribution, independent of pricing. */
+export interface TokenUsageRow extends TokenComponents {
+  readonly agent: string;
+  readonly modelId: string;
+  readonly providerId: string;
+}
+
+export interface TokenAgentTotal {
+  readonly agent: string;
+  /** Known subtotal for the group, or null when none of its counts are known. */
+  readonly totalTokens: number | null;
+  /** True only when every count of every included row is known. */
+  readonly complete: boolean;
+}
+
+export interface TokenModelTotal {
+  /** The model id, merged across providers. */
+  readonly model: string;
+  readonly totalTokens: number | null;
+  readonly complete: boolean;
+}
+
+export interface TokenProviderTotal {
+  readonly provider: string;
+  readonly totalTokens: number | null;
+  readonly complete: boolean;
+}
+
+/** Read-only token projection carried alongside the unchanged dollar summary. */
+export interface TokenSummary {
+  readonly totalTokens: number | null;
+  readonly complete: boolean;
+  readonly agents: readonly TokenAgentTotal[];
+  readonly models: readonly TokenModelTotal[];
+  readonly providers: readonly TokenProviderTotal[];
+}
+
+/**
+ * A `summary` reply. The additive token view is optional so a reply from an older server, and an
+ * older client that ignores it, both stay valid.
+ */
+export interface SummaryReply extends Summary {
+  readonly tokens?: TokenSummary;
+}
+
 /** A row that may carry a cache-write cost, priced in code at read time. */
 export interface Candidate {
   readonly agent: string;

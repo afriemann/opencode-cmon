@@ -20,6 +20,13 @@ import type { CostRow } from "./types";
 let dir: string;
 let dbPath: string;
 const opened: Store[] = [];
+const readers: Database[] = [];
+
+function reader(): Database {
+  const db = new Database(dbPath, { readonly: true });
+  readers.push(db);
+  return db;
+}
 
 function open(): Store {
   const store = new Store({ dbPath });
@@ -61,6 +68,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const db of readers.splice(0)) db.close();
   for (const store of opened.splice(0)) store.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -77,7 +85,7 @@ describe("store", () => {
     const store = open();
     store.upsertLive(row({ agent: "build", createdAt: 500 }));
     store.upsertLive(row({ agent: "unknown", createdAt: 9_000 }));
-    const stored = new Database(dbPath, { readonly: true })
+    const stored = reader()
       .query("SELECT agent, created_at AS t FROM cost_entry WHERE id = 'msg_1'")
       .get();
     expect(stored).toEqual({ agent: "build", t: 500 });
@@ -101,7 +109,7 @@ describe("store", () => {
         parentSessionId: "ses_parent",
       }),
     );
-    const stored = new Database(dbPath, { readonly: true })
+    const stored = reader()
       .query(
         "SELECT agent, parent_session_id AS p FROM cost_entry WHERE id = 'm1'",
       )
@@ -291,7 +299,7 @@ describe("store", () => {
 
   describe("tokens", () => {
     const stored = (id = "msg_1") =>
-      new Database(dbPath, { readonly: true })
+      reader()
         .query(
           "SELECT tokens_input i, tokens_cache_read r, tokens_cache_write w FROM cost_entry WHERE id = $id",
         )
@@ -515,7 +523,7 @@ describe("store", () => {
       return names;
     };
     const details = (id = "msg_1") =>
-      new Database(dbPath, { readonly: true })
+      reader()
         .query(
           "SELECT tokens_output o, tokens_reasoning r, finish f, directory d FROM cost_entry WHERE id = $id",
         )

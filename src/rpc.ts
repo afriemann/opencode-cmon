@@ -52,6 +52,65 @@ export const CostRpc = Rpc.define({
             },
           },
           complete: { type: "boolean" },
+          // Additive token view. Optional so a reply from an older server stays valid.
+          tokens: {
+            type: "object",
+            properties: {
+              totalTokens: {
+                anyOf: [{ type: "number" }, { type: "null" }],
+              },
+              complete: { type: "boolean" },
+              agents: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    agent: { type: "string" },
+                    totalTokens: {
+                      anyOf: [{ type: "number" }, { type: "null" }],
+                    },
+                    complete: { type: "boolean" },
+                  },
+                  required: ["agent", "totalTokens", "complete"],
+                },
+              },
+              models: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    model: { type: "string" },
+                    totalTokens: {
+                      anyOf: [{ type: "number" }, { type: "null" }],
+                    },
+                    complete: { type: "boolean" },
+                  },
+                  required: ["model", "totalTokens", "complete"],
+                },
+              },
+              providers: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    provider: { type: "string" },
+                    totalTokens: {
+                      anyOf: [{ type: "number" }, { type: "null" }],
+                    },
+                    complete: { type: "boolean" },
+                  },
+                  required: ["provider", "totalTokens", "complete"],
+                },
+              },
+            },
+            required: [
+              "totalTokens",
+              "complete",
+              "agents",
+              "models",
+              "providers",
+            ],
+          },
         },
         required: ["revision", "totalMicros", "agents", "complete"],
       },

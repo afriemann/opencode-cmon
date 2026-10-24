@@ -29,6 +29,13 @@ const CUTOFF = 1_000_000;
 let dir: string;
 let sourcePath: string;
 let store: Store;
+const readers: Database[] = [];
+
+function reader(): Database {
+  const db = new Database(join(dir, "cmon.db"), { readonly: true });
+  readers.push(db);
+  return db;
+}
 const logs: string[] = [];
 const log = (message: string) => logs.push(message);
 const WRITE_TOKENS = {
@@ -78,6 +85,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const db of readers.splice(0)) db.close();
   store.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -435,7 +443,7 @@ describe("backfill", () => {
   });
 
   describe("token fill", () => {
-    const raw = () => new Database(join(dir, "cmon.db"), { readonly: true });
+    const raw = reader;
     const tokensOf = (id: string) =>
       raw()
         .query(
@@ -605,7 +613,7 @@ describe("backfill", () => {
   });
 
   describe("details", () => {
-    const raw = () => new Database(join(dir, "cmon.db"), { readonly: true });
+    const raw = reader;
     const detailsOf = (id: string) =>
       raw()
         .query(

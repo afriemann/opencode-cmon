@@ -12,7 +12,7 @@ import { createRecorder, type CostEvent } from "./recorder";
 import { CostRpc } from "./rpc";
 import { createCostTools } from "./tools";
 import { opencodeDataDir, Store } from "./store";
-import { buildSummary } from "./summary";
+import { buildSummary, buildTokenSummary } from "./summary";
 import { retentionCutoff } from "./time";
 import { join } from "node:path";
 
@@ -114,6 +114,7 @@ export default Plugin.define({
           models: built.models,
           providers: built.providers,
           complete: built.complete,
+          tokens: buildTokenSummary(inputs.tokenRows),
         };
       },
     });

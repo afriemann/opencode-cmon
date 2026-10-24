@@ -10,6 +10,7 @@ import type {
   EntryKind,
   ModelTotal,
   ProviderTotal,
+  TokenUsageRow,
 } from "./types";
 
 /** Narrows the rows an analysis reads. `[from, to)` is half-open epoch milliseconds. */
@@ -609,6 +610,10 @@ export class Store {
    * Per-agent, per-model-id and per-provider sums of opencode's own cost over `[from, to)` plus the rows
    * that may carry a cache-write cost, read in one snapshot so they agree. Ordering and the add-on
    * are applied in code (`buildSummary`).
+   *
+   * `tokenRows` carries the same retained rows' raw nullable token columns for the additive token
+   * projection: it deliberately applies no pricing subset and no zero filling, so unknown counts stay
+   * distinguishable from measured zeros.
    */
   summaryInputs(
     from: number,
@@ -619,6 +624,7 @@ export class Store {
     models: ModelTotal[];
     providers: ProviderTotal[];
     candidates: Candidate[];
+    tokenRows: TokenUsageRow[];
   } {
     const read = this.db.transaction(() => {
       const agents = this.totalsBy<AgentTotal>("agent", "agent", from, to);
@@ -664,9 +670,48 @@ export class Store {
         outputTokens: row.tokens_output,
         reasoningTokens: row.tokens_reasoning,
       }));
-      return { agents, models, providers, candidates };
+      return {
+        agents,
+        models,
+        providers,
+        candidates,
+        tokenRows: this.tokenRows(from, to),
+      };
     });
     return { revision: this.revisionCounter, ...read.deferred() };
+  }
+
+  /**
+   * Raw nullable token counts of every row in `[from, to)`, regardless of cost, provider, kind,
+   * failure or pricing availability. A known zero stays `0`; an unknown count stays `null`.
+   */
+  private tokenRows(from: number, to: number): TokenUsageRow[] {
+    const rows = this.db
+      .query(
+        `SELECT agent, model_id, provider_id, tokens_input, tokens_cache_read, tokens_cache_write,
+                tokens_output, tokens_reasoning
+         FROM cost_entry WHERE created_at >= $from AND created_at < $to`,
+      )
+      .all({ $from: from, $to: to }) as Array<{
+      agent: string;
+      model_id: string;
+      provider_id: string;
+      tokens_input: number | null;
+      tokens_cache_read: number | null;
+      tokens_cache_write: number | null;
+      tokens_output: number | null;
+      tokens_reasoning: number | null;
+    }>;
+    return rows.map((row) => ({
+      agent: row.agent,
+      modelId: row.model_id,
+      providerId: row.provider_id,
+      input: row.tokens_input,
+      cacheRead: row.tokens_cache_read,
+      cacheWrite: row.tokens_cache_write,
+      output: row.tokens_output,
+      reasoning: row.tokens_reasoning,
+    }));
   }
 
   /** Deletes rows older than `cutoff`; returns how many were removed. */

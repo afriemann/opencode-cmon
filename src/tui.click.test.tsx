@@ -5,6 +5,7 @@ import { testRender } from "@opentui/solid";
 import { createStore, produce } from "solid-js/store";
 import { CostSidebar } from "./tui";
 import type { Summary } from "./types";
+import { storage } from "./test-support/token-host";
 
 const SUMMARY: Summary = {
   revision: 1,
@@ -32,6 +33,7 @@ function context({ open = true, summary }: Setup, saves: unknown[]) {
       }),
     },
     storage: {
+      memory: storage().memory,
       store: () => [
         view,
         async (mutate: (draft: { open: boolean }) => void) => {
@@ -76,8 +78,10 @@ describe("sidebar tabs", () => {
     const rows = await frame();
     await t.mockMouse.click(col(rows, "Models"), 1);
     const after = await frame();
-    expect(after[1]!.trim()).toBe("View  Agents  [Models]  Providers");
-    expect(after[2]).toContain("claude-sonnet-4-5");
+    expect(after[1]!.trim()).toMatch(
+      /^View {2}Agents {4}\[Models\] {2}Providers$/,
+    );
+    expect(after.join("\n")).toContain("claude-sonnet-4-5");
     t.renderer.destroy();
   });
 
@@ -95,8 +99,10 @@ describe("sidebar tabs", () => {
     const rows = await frame();
     await t.mockMouse.click(col(rows, "Providers"), 1);
     const after = await frame();
-    expect(after[1]!.trim()).toBe("View  Agents  Models  [Providers]");
-    expect(after[2]).toContain("anthropic");
+    expect(after[1]!.trim()).toMatch(
+      /^View {2}Agents {4}Models {4}\[Providers\]$/,
+    );
+    expect(after.join("\n")).toContain("anthropic");
     t.renderer.destroy();
   });
 
@@ -110,7 +116,9 @@ describe("sidebar tabs", () => {
     await t.mockMouse.click(38, 1);
     const after = await frame();
     expect(after[0]).toContain("▼");
-    expect(after[1]!.trim()).toBe("View  [Agents]  Models  Providers");
+    expect(after[1]!.trim()).toMatch(
+      /^View {2}\[Agents\] {2}Models {4}Providers$/,
+    );
     expect(saves).toEqual([]);
     t.renderer.destroy();
   });
@@ -179,7 +187,7 @@ describe("sidebar chrome", () => {
     const rows = await frame();
     await t.mockMouse.click(col(rows, "Providers"), 1);
     expect((await frame())[1]!.trim()).toBe(
-      "View  Agents  Models  [Providers]",
+      "View  Agents    Models    [Providers]",
     );
     await t.mockMouse.click(0, 0);
     expect((await frame())[1] ?? "").not.toContain("View");
@@ -190,8 +198,10 @@ describe("sidebar chrome", () => {
 describe("sidebar selection", () => {
   test("A drag across the block selects only the content", async () => {
     const { t, frame } = await render();
-    await frame();
-    await t.mockMouse.drag(6, 2, 0, 0);
+    const rows = await frame();
+    const y = rows.findIndex((row) => row.includes("build"));
+    expect(y).toBeGreaterThanOrEqual(0);
+    await t.mockMouse.drag(6, y, 0, 0);
     await frame();
     const selected = t.renderer.getSelection()?.getSelectedText() ?? "";
     expect(selected).toContain("build");

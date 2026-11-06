@@ -22,7 +22,7 @@ const responseUsage = {
 };
 
 function fixture(
-  body: BodyInit | null,
+  body: ConstructorParameters<typeof Response>[0],
   path = "/chat/completions",
   type = "application/json",
 ): ProbeResponse {

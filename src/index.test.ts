@@ -548,10 +548,10 @@ describe("Copilot usage probe integration", () => {
     expect(fake.hookDisposals()).toBe(1);
     for (const hookFailure of ["register", "dispose"] as const) {
       const failed = fakeContext({ copilotUsageProbe: true, hookFailure });
-      await start(failed.ctx);
+      const stop = await start(failed.ctx);
       expect(failed.registeredTools.has("cost_report")).toBe(true);
       await expect(failed.summary()).resolves.toBeDefined();
-      await cleanup?.();
+      await stop();
       cleanup = undefined;
       expect(failed.toolDisposals()).toBe(1);
       expect(failed.hookDisposals()).toBe(hookFailure === "dispose" ? 1 : 0);
@@ -559,11 +559,12 @@ describe("Copilot usage probe integration", () => {
   });
 });
 
-async function start(ctx: unknown): Promise<void> {
+async function start(ctx: unknown): Promise<() => Promise<void>> {
   const result = await (
     plugin as unknown as { setup: (c: unknown) => Promise<() => Promise<void>> }
   ).setup(ctx);
   cleanup = result;
+  return result;
 }
 
 beforeEach(() => {

@@ -1,14 +1,7 @@
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-recording/spec.md
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-display/spec.md
-// spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
-// spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
-// spec: openspec/changes/add-cost-analysis-tools/specs/cost-recording/spec.md
-// spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
-// spec: openspec/changes/add-cache-gap-analysis/specs/cost-analysis/spec.md
+// spec: openspec/specs/cost-recording/spec.md
+// spec: openspec/specs/cost-retention/spec.md
+// spec: openspec/specs/cost-display/spec.md
+// spec: openspec/specs/cost-analysis/spec.md
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -176,7 +169,7 @@ describe("store", () => {
     expect(total(store)).toBe(100_000);
   });
 
-  // spec: openspec/changes/fix-unknown-attribution/specs/cost-retention/spec.md
+  // spec: openspec/specs/cost-retention/spec.md
   test("Live data wins over backfilled data", () => {
     const store = open();
     store.completeBackfill([row({ costMicros: 1 })]);
@@ -197,7 +190,7 @@ describe("store", () => {
     expect(total(store)).toBe(5);
   });
 
-  // spec: openspec/changes/fix-unknown-attribution/specs/cost-recording/spec.md
+  // spec: openspec/specs/cost-recording/spec.md
   describe("step attribution merges", () => {
     const snapshot = () => {
       const db = new Database(dbPath, { readonly: true });

@@ -1,6 +1,5 @@
-// spec: openspec/changes/fix-cache-write-addon-per-row/specs/cost-display/spec.md
-// spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
-// spec: openspec/changes/add-cache-gap-analysis/specs/cost-analysis/spec.md
+// spec: openspec/specs/cost-display/spec.md
+// spec: openspec/specs/cost-analysis/spec.md
 import { describe, expect, test } from "bun:test";
 import {
   buildHotspots,

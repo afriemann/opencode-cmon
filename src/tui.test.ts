@@ -1,10 +1,4 @@
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-display/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
-// spec: openspec/changes/refine-cost-display/specs/cost-display/spec.md
-// spec: openspec/changes/add-model-breakdown/specs/cost-display/spec.md
-// spec: openspec/changes/retry-feed-on-error/specs/cost-display/spec.md
-// spec: openspec/changes/fix-missing-models-crash/specs/cost-display/spec.md
-// spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
+// spec: openspec/specs/cost-display/spec.md
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { createRoot } from "solid-js";
 import plugin, {

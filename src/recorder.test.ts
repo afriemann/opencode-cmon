@@ -1,6 +1,4 @@
-// spec: openspec/changes/fix-unknown-attribution/specs/cost-recording/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
-// spec: openspec/changes/add-cost-analysis-tools/specs/cost-recording/spec.md
+// spec: openspec/specs/cost-recording/spec.md
 import { describe, expect, test } from "bun:test";
 import { createRecorder, type CostEvent } from "./recorder";
 

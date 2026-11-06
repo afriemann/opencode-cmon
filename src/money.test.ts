@@ -1,4 +1,4 @@
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-recording/spec.md
+// spec: openspec/specs/cost-recording/spec.md
 import { describe, expect, test } from "bun:test";
 import { formatUsd, usdToMicros } from "./money";
 

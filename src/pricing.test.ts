@@ -1,6 +1,5 @@
-// spec: openspec/changes/fix-cache-write-addon-per-row/specs/cost-display/spec.md
-// spec: openspec/changes/account-for-cache-writes/specs/cost-recording/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
+// spec: openspec/specs/cost-display/spec.md
+// spec: openspec/specs/cost-recording/spec.md
 import { describe, expect, jest, test } from "bun:test";
 import {
   cacheWriteExtraMicros,
@@ -391,7 +390,10 @@ describe("rowAddOn per-row cache-write decision", () => {
       ],
     ]);
     // context 240,000 > 200,000: expected = 20,000 + 40,000*0 ; add-on = 40,000*1.25*4 = 200,000
-    const big = row({ tokens: counts(40_000, 200_000), costMicros: 800_000 + 20_000 });
+    const big = row({
+      tokens: counts(40_000, 200_000),
+      costMicros: 800_000 + 20_000,
+    });
     expect(rowAddOn(big, tiered)).toEqual({ kind: "micros", micros: 200_000 });
   });
 });

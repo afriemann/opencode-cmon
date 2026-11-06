@@ -1,6 +1,4 @@
-// spec: openspec/changes/fix-cache-write-addon-per-row/specs/cost-display/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
-// spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
+// spec: openspec/specs/cost-display/spec.md
 import { describe, expect, test } from "bun:test";
 import { parseCatalog } from "./pricing";
 import { buildSummary } from "./summary";

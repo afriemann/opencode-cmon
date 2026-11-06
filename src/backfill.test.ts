@@ -1,6 +1,4 @@
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
-// spec: openspec/changes/add-cost-analysis-tools/specs/cost-retention/spec.md
+// spec: openspec/specs/cost-retention/spec.md
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -82,7 +80,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-// spec: openspec/changes/fix-unknown-attribution/specs/cost-recording/spec.md
+// spec: openspec/specs/cost-recording/spec.md
 describe("attribution repair", () => {
   const unknownStep = (
     id = "msg_1",

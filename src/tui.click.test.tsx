@@ -1,5 +1,4 @@
-// spec: openspec/changes/add-provider-breakdown/specs/cost-display/spec.md
-// spec: openspec/changes/unselectable-controls/specs/cost-display/spec.md
+// spec: openspec/specs/cost-display/spec.md
 import { describe, expect, test } from "bun:test";
 import { testRender } from "@opentui/solid";
 import { createStore, produce } from "solid-js/store";

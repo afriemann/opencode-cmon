@@ -1,4 +1,4 @@
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-display/spec.md
+// spec: openspec/specs/cost-display/spec.md
 import { describe, expect, test } from "bun:test";
 import { localMonthRange, retentionCutoff } from "./time";
 

@@ -32,7 +32,17 @@ bun install && bun run build
 
 Load `dist/index.js` as a server plugin (e.g. symlink into `~/.config/opencode/plugins/`) and `dist` as a TUI plugin via `plugins` in `~/.config/opencode/cli.json`.
 
-Options (server plugin): `dbPath`, `sourceDbPath`.
+Options (server plugin): `dbPath`, `sourceDbPath`, `copilotUsageProbe` (default `false`).
+
+### Copilot usage probe
+
+Set `copilotUsageProbe: true` in the server plugin's options to inspect existing GitHub Copilot `/chat/completions` and `/responses` JSON/SSE responses. This is diagnostic only: it makes no provider requests and changes no recorded costs or prices. Leave it disabled unless investigating usage metadata.
+
+The probe samples at most two responses per endpoint per plugin load, including failed samples. Inspection stops after 1 MiB per response, 64 KiB per SSE event, 30 seconds from response-hook entry, or plugin unload. It follows consumer reads without a separate draining branch; inspection adds bounded parsing work. Slow or abandoned consumers can therefore produce incomplete samples. Response delivery continues after inspection stops.
+
+Structured stderr entries with `message: "copilot usage observation"` contain an endpoint category, outcome, snapshot count, validated host model ID when available, and fixed numeric usage fields. `fields` distinguishes present, invalid, absent and unknown; `usageState` distinguishes a usage object from no usage or incomplete evidence. Multiple snapshots use the latest values, not their sum. `cacheWrite`, `billedCost` and `nanoAiu` inspect candidate usage keys `cache_write_tokens`, `cost` and `totalNanoAiu`; their presence does not establish billing units, currency or meaning. A cutoff, malformed stream or transport error is not evidence that billing fields are absent.
+
+Bodies are inspected transiently within the limits, never logged or stored by the plugin. Output excludes prompts, generated text, headers, URLs, credentials, response/session IDs and arbitrary field names. There is no export or ledger storage; stderr retention is controlled by the host's log policy. Disable the option and reload the plugin after collecting samples. Hook incompatibility leaves the probe inactive without disabling normal cost tracking.
 
 ## Develop
 

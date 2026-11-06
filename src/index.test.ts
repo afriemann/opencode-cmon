@@ -1,9 +1,7 @@
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-retention/spec.md
-// spec: openspec/changes/add-monthly-cost-tracking/specs/cost-recording/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-retention/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-recording/spec.md
-// spec: openspec/changes/compute-cache-writes-at-read/specs/cost-display/spec.md
-// spec: openspec/changes/add-cost-analysis-tools/specs/cost-analysis/spec.md
+// spec: openspec/specs/cost-retention/spec.md
+// spec: openspec/specs/cost-recording/spec.md
+// spec: openspec/specs/cost-display/spec.md
+// spec: openspec/specs/cost-analysis/spec.md
 import {
   afterEach,
   beforeEach,
@@ -20,10 +18,11 @@ import plugin from "./index";
 import { Database } from "bun:sqlite";
 import { Store } from "./store";
 import { createAttributionDiagnostics } from "./backfill";
+import type { ProbeResponse } from "./copilot-usage-probe";
 
 const MODEL = { providerID: "github-copilot", id: "claude-sonnet-4.6" };
 
-// spec: openspec/changes/fix-unknown-attribution/specs/cost-recording/spec.md
+// spec: openspec/specs/cost-recording/spec.md
 describe("exact persisted attribution", () => {
   test("Failure diagnostics exclude source and identifying content", async () => {
     const path = join(dir, "sensitive-path.db");
@@ -340,11 +339,15 @@ function fakeContext(
     sourceDbPath?: string;
     hangCatalog?: boolean;
     gatedCatalog?: boolean;
+    copilotUsageProbe?: unknown;
+    hookFailure?: "register" | "dispose";
   } = {},
 ) {
   const emitted: unknown[] = [];
   const registeredTools = new Map<string, ToolLike>();
   let toolDisposals = 0;
+  const responseHooks: unknown[][] = [];
+  let hookDisposals = 0;
   const toolEditor = {
     add: (tool: ToolLike) => void registeredTools.set(tool.name, tool),
   };
@@ -363,6 +366,7 @@ function fakeContext(
       dbPath,
       sourceDbPath: options.sourceDbPath ?? join(dir, "absent.db"),
       notifyDebounceMs: 20,
+      copilotUsageProbe: options.copilotUsageProbe,
     },
     rpc: {
       register: async (
@@ -379,6 +383,18 @@ function fakeContext(
       },
     },
     session: {
+      hook: async (...args: unknown[]) => {
+        responseHooks.push(args);
+        if (options.hookFailure === "register")
+          throw new Error("private hook failure");
+        return {
+          dispose: async () => {
+            hookDisposals += 1;
+            if (options.hookFailure === "dispose")
+              throw new Error("private hook failure");
+          },
+        };
+      },
       get: async ({ sessionID }: { sessionID: string }) =>
         sessionID === "ses_c"
           ? { parentID: "ses_p", location: { directory: "/work/app" } }
@@ -423,6 +439,8 @@ function fakeContext(
   return {
     ctx,
     emitted,
+    responseHooks,
+    hookDisposals: () => hookDisposals,
     registeredTools,
     transforms,
     toolDisposals: () => toolDisposals,
@@ -463,6 +481,83 @@ function createSource(path: string): void {
 
 const settle = (): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, 30));
+
+// spec: openspec/specs/cost-recording/spec.md
+describe("Copilot usage probe integration", () => {
+  test("Disabled probe does not intercept responses", async () => {
+    for (const value of [undefined, false, "true", 1]) {
+      const fake = fakeContext({ copilotUsageProbe: value });
+      await start(fake.ctx);
+      expect(fake.responseHooks).toEqual([]);
+      await cleanup?.();
+      cleanup = undefined;
+    }
+  });
+
+  test("Enabled probe selects supported Copilot responses", async () => {
+    const fake = fakeContext({ copilotUsageProbe: true });
+    await start(fake.ctx);
+    expect(
+      fake.responseHooks.map(([name, , options]) => ({ name, options })),
+    ).toEqual([
+      { name: "http.response", options: { providerID: "github-copilot" } },
+    ]);
+    const observe = fake.responseHooks[0]![1] as (event: ProbeResponse) => void;
+    for (const [providerID, path, type, body] of [
+      ["other", "/responses", "application/json", "{}"],
+      ["github-copilot", "/models", "application/json", "{}"],
+      ["github-copilot", "/responses", "text/plain", "{}"],
+      ["github-copilot", "/responses", "application/json", null],
+    ] as const) {
+      const event: ProbeResponse = {
+        model: { providerID, id: "gpt-6.1-sol" },
+        request: new Request(`https://api.example.com${path}`),
+        response: new Response(body, { headers: { "content-type": type } }),
+      };
+      const original = event.response;
+      observe(event);
+      expect(event.response).toBe(original);
+    }
+    const locked: ProbeResponse = {
+      model: MODEL,
+      request: new Request("https://api.example.com/responses"),
+      response: new Response("{}", {
+        headers: { "content-type": "application/json" },
+      }),
+    };
+    const reader = locked.response.body!.getReader();
+    const original = locked.response;
+    observe(locked);
+    expect(locked.response).toBe(original);
+    reader.releaseLock();
+    for (const path of ["/chat/completions", "/responses"]) {
+      const event: ProbeResponse = {
+        model: MODEL,
+        request: new Request(`https://api.example.com${path}`),
+        response: new Response("{}", {
+          headers: { "content-type": "application/json" },
+        }),
+      };
+      const original = event.response;
+      observe(event);
+      expect(event.response).not.toBe(original);
+      expect(await event.response.text()).toBe("{}");
+    }
+    await cleanup?.();
+    cleanup = undefined;
+    expect(fake.hookDisposals()).toBe(1);
+    for (const hookFailure of ["register", "dispose"] as const) {
+      const failed = fakeContext({ copilotUsageProbe: true, hookFailure });
+      await start(failed.ctx);
+      expect(failed.registeredTools.has("cost_report")).toBe(true);
+      await expect(failed.summary()).resolves.toBeDefined();
+      await cleanup?.();
+      cleanup = undefined;
+      expect(failed.toolDisposals()).toBe(1);
+      expect(failed.hookDisposals()).toBe(hookFailure === "dispose" ? 1 : 0);
+    }
+  });
+});
 
 async function start(ctx: unknown): Promise<void> {
   const result = await (

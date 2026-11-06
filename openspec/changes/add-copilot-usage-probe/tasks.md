@@ -1,0 +1,6 @@
+- [x] 1.1 Implement opt-in integration for “Disabled probe does not intercept responses” and “Enabled probe selects supported Copilot responses”.
+- [x] 1.2 Implement forwarding per design for “Forwarding follows consumer demand” and “Cancellation and source failures propagate”.
+- [x] 1.3 Implement lifecycle bounds for “Concurrent samples consume reservations once” and “Limits and disposal stop inspection only”.
+- [x] 1.4 Implement projection for “Standard usage is projected without summing snapshots” and “Missing malformed and incomplete usage remain distinguishable”.
+- [x] 1.5 Implement failure isolation for “Sensitive and unknown content is excluded” and “Observation and sink failures leave delivery usable”.
+- [x] 1.6 Document probe activation and diagnostic interpretation in README.md.

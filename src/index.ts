@@ -1,4 +1,5 @@
 import { Plugin } from "@opencode/plugin";
+import { createCopilotUsageProbe } from "./copilot-usage-probe";
 import {
   createAttributionDiagnostics,
   lookupAttribution,
@@ -140,6 +141,39 @@ export default Plugin.define({
       for (const tool of costTools) editor.add(tool);
     });
 
+    const probe =
+      options.copilotUsageProbe === true
+        ? createCopilotUsageProbe((diagnostic) => {
+            process.stderr.write(
+              JSON.stringify({
+                service: "opencode-cmon",
+                level: "debug",
+                message: "copilot usage observation",
+                ...diagnostic,
+              }) + "\n",
+            );
+          })
+        : undefined;
+    let probeRegistration: { dispose(): Promise<void> } | undefined;
+    if (probe) {
+      try {
+        probeRegistration = await ctx.session.hook(
+          "http.response",
+          probe.observe,
+          { providerID: "github-copilot" },
+        );
+      } catch {
+        probe.dispose();
+        try {
+          process.stderr.write(
+            '{"service":"opencode-cmon","level":"warn","message":"copilot usage probe inactive","reason":"hook-unavailable"}\n',
+          );
+        } catch {
+          /* Diagnostics cannot disable cost tracking. */
+        }
+      }
+    }
+
     const pruneTimer = setInterval(() => {
       try {
         if (store.prune(cutoff()) > 0) scheduleNotify();
@@ -207,6 +241,12 @@ export default Plugin.define({
     })();
 
     return async () => {
+      probe?.dispose();
+      try {
+        await probeRegistration?.dispose();
+      } catch {
+        // A failed host unregistration must not retain observer buffers or the ledger.
+      }
       abort.abort();
       clearInterval(pruneTimer);
       await loop;

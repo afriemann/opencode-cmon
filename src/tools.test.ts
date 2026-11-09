@@ -254,3 +254,21 @@ describe("cost tools", () => {
     expect(reloads).toBe(1);
   });
 });
+
+describe("cache stall findings through the tool", () => {
+  test("cost_hotspots reports a cache stall with its evidence", async () => {
+    const base = new Date(2026, 9, 2).getTime();
+    for (let i = 0; i < 6; i += 1)
+      store.upsertLive(
+        row({
+          id: `st${i}`,
+          createdAt: base + i * 60_000,
+          tokens: { input: 60_000 + i * 10_000, cacheRead: 36_655, cacheWrite: 0 },
+        }),
+      );
+    const result = await call("cost_hotspots");
+    expect(result.content).toContain("cache_stall [s1]");
+    expect(result.content).toContain("6 steps");
+    expect(result.content).toContain("ongoing");
+  });
+});

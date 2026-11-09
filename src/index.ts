@@ -14,6 +14,7 @@ import { CostRpc } from "./rpc";
 import { createCostTools } from "./tools";
 import { opencodeDataDir, Store } from "./store";
 import { buildSummary } from "./summary";
+import { createStallWatch, ongoingStalls, STALL_WINDOW_MS } from "./stall-watch";
 import { retentionCutoff } from "./time";
 import { join } from "node:path";
 
@@ -108,7 +109,22 @@ export default Plugin.define({
         const inputs = store.summaryInputs(from, to);
         const built = buildSummary(inputs, inputs.candidates, lookup.table());
         if (built.unpriced.length > 0) lookup.refresh("miss");
+        let stalls: ReturnType<typeof ongoingStalls> = [];
+        try {
+          stalls = ongoingStalls(
+            store.filteredRows({
+              from: Math.max(from, Date.now() - STALL_WINDOW_MS),
+              to,
+              kind: "step",
+            }).rows,
+            lookup.table(),
+            Date.now(),
+          );
+        } catch (error) {
+          log(`stall summary failed: ${String(error)}`);
+        }
         return {
+          stalls,
           revision: inputs.revision,
           totalMicros: built.totalMicros,
           agents: built.agents,
@@ -204,6 +220,25 @@ export default Plugin.define({
       now: Date.now,
     });
 
+    const stallWatch = createStallWatch({
+      sessionSteps: (sessionId, since) => store.sessionSteps(sessionId, since),
+      catalog: () => lookup.table(),
+      now: Date.now,
+      announce: (alert) => {
+        registration.current?.events
+          .emit("cacheStall", {
+            sessionID: alert.sessionId,
+            modelId: alert.modelId,
+            steps: alert.steps,
+            wastedMicros: alert.wastedMicros,
+            startedAt: alert.startedAt,
+          })
+          .catch((error: unknown) =>
+            log(`failed to emit cacheStall: ${String(error)}`),
+          );
+      },
+    });
+
     const abort = new AbortController();
     const loop = (async () => {
       try {
@@ -225,6 +260,11 @@ export default Plugin.define({
                 throw error;
               }
               scheduleNotify();
+              try {
+                stallWatch.observe(row);
+              } catch (error) {
+                log(`stall detection failed: ${String(error)}`);
+              }
             }
           } catch (error) {
             try {

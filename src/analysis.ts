@@ -1,5 +1,5 @@
 import { formatUsd } from "./money";
-import { rowAddOn, type PriceTable } from "./pricing";
+import { priceKey, rowAddOn, selectTier, type PriceTable } from "./pricing";
 import { localMonthRange, RETENTION_MONTHS, retentionCutoff } from "./time";
 import type { CostRow } from "./types";
 
@@ -30,6 +30,12 @@ export const IDLE_REWRITE_MAX_READ_SHARE = 0.5;
 const GAP_BUCKETS = ["first", "<1m", "1-5m", ">5m"] as const;
 /** Floor for the first step's input-side tokens in the growth ratio, so a tiny first step cannot inflate it. */
 export const GROWTH_BASELINE_TOKENS = 5_000;
+/** Consecutive steps that make a cache stall. */
+export const STALL_MIN_STEPS = 5;
+/** Uncached input tokens a step needs to count toward a stall. */
+export const STALL_MIN_INPUT_TOKENS = 20_000;
+/** Cache-read growth, as a share of a step's input-side tokens, still counted as a constant read. */
+export const STALL_READ_TOLERANCE = 0.02;
 /** Most findings of one session- or step-level type. */
 export const TOP_PER_TYPE = 3;
 
@@ -214,6 +220,8 @@ export interface GroupStats {
   /** Cache-read share of input-side tokens; null when no cache tokens were reported. */
   readonly cacheReadRatio: number | null;
   readonly failedMicros: number;
+  /** Steps that belong to a cache stall. */
+  readonly stalledSteps: number;
 }
 
 export interface Report {
@@ -257,6 +265,7 @@ function statsOf(
   key: string,
   entries: readonly PricedRow[],
   total: number,
+  stalledIds: ReadonlySet<string>,
 ): GroupStats {
   const tokens = {
     input: 0,
@@ -291,6 +300,7 @@ function statsOf(
         : tokens.cacheRead /
           (tokens.input + tokens.cacheRead + tokens.cacheWrite),
     failedMicros,
+    stalledSteps: entries.filter((e) => stalledIds.has(e.row.id)).length,
   };
 }
 
@@ -310,8 +320,9 @@ export function buildReport(
     keyOf(entry.row, options.groupBy, input.gaps),
   );
   const metric = SORTS[options.sort];
+  const stalledIds = stalledRowIds(priced.rows);
   const all = [...buckets].map(([key, entries]) =>
-    statsOf(key, entries, total),
+    statsOf(key, entries, total, stalledIds),
   );
   const bucketOrder = (key: string): number =>
     (GAP_BUCKETS as readonly string[]).indexOf(key);
@@ -328,7 +339,7 @@ export function buildReport(
     const entries = priced.rows.filter((e) =>
       restKeys.has(keyOf(e.row, options.groupBy, input.gaps)),
     );
-    groups.push(statsOf("others", entries, total));
+    groups.push(statsOf("others", entries, total, stalledIds));
   }
   const excluded = excludedOf(input);
   return {
@@ -353,6 +364,7 @@ export type FindingType =
   | "subagent_fanout"
   | "input_growth"
   | "idle_cache_rewrite"
+  | "cache_stall"
   | "agent_model_mix";
 
 export interface Finding {
@@ -368,6 +380,8 @@ export interface Finding {
   readonly share: number;
   readonly suggestion: string | null;
   readonly basis: string;
+  /** Details of a `cache_stall` finding. */
+  readonly stall?: Stall;
 }
 
 export interface Hotspots {
@@ -430,6 +444,131 @@ function groupBy<T>(
     else map.set(name, [item]);
   }
   return map;
+}
+
+
+export interface Stall {
+  readonly sessionId: string;
+  readonly modelId: string;
+  /** created_at of the first stalled step. */
+  readonly startedAt: number;
+  readonly steps: number;
+  /** The stall reaches the session's last step with known tokens. */
+  readonly ongoing: boolean;
+  /** created_at of the last stalled step. */
+  readonly endedAt: number;
+  /** Cache-read tokens of the run's first step. */
+  readonly cacheRead: number;
+  /** An earlier step of the session read at least LOW_CACHE_READ_RATIO from cache. */
+  readonly healthyBefore: boolean;
+  readonly stalledCostMicros: number;
+  /** Stalled input billed at the catalog cache-read rate instead; absent when any step is unpriced. */
+  readonly estimatedSavingsMicros?: number;
+  readonly rowIds: readonly string[];
+}
+
+const cacheShare = (t: { input: number; cacheRead: number }): number =>
+  t.cacheRead / (t.input + t.cacheRead);
+
+function stallSavings(
+  run: readonly PricedRow[],
+  catalog: PriceTable,
+): number | undefined {
+  let savings = 0;
+  for (const { row } of run) {
+    const price = catalog.get(priceKey(row.providerId, row.modelId));
+    const tier = price && row.tokens && selectTier(price.cost, row.tokens);
+    if (!tier || !row.tokens) return undefined;
+    // USD per million tokens equals micro-USD per token.
+    savings += row.tokens.input * (tier.input - tier.cache.read);
+  }
+  return Math.round(savings);
+}
+
+function stallsOf(
+  entries: readonly PricedRow[],
+  catalog: PriceTable,
+): Stall[] {
+  const found: Stall[] = [];
+  const sessions = groupBy(
+    entries.filter((e) => e.row.kind === "step" && e.row.tokens !== null),
+    (e) => e.row.sessionId,
+  );
+  for (const [sessionId, group] of sessions) {
+    const steps = [...group].sort(
+      (a, b) =>
+        a.row.createdAt - b.row.createdAt || (a.row.id < b.row.id ? -1 : 1),
+    );
+    const tokens = (i: number) => steps[i]!.row.tokens!;
+    const candidate = (i: number): boolean =>
+      tokens(i).input >= STALL_MIN_INPUT_TOKENS &&
+      cacheShare(tokens(i)) < LOW_CACHE_READ_RATIO;
+    let i = 0;
+    while (i < steps.length) {
+      if (!candidate(i)) {
+        i += 1;
+        continue;
+      }
+      const base = tokens(i).cacheRead;
+      if (base === 0) {
+        i += 1;
+        continue;
+      }
+      let end = i + 1;
+      while (end < steps.length && candidate(end)) {
+        const t = tokens(end);
+        const excess = t.cacheRead - base;
+        if (excess > STALL_READ_TOLERANCE * (t.input + t.cacheRead)) break;
+        end += 1;
+      }
+      if (end - i >= STALL_MIN_STEPS) {
+        const run = steps.slice(i, end);
+        const savings = stallSavings(run, catalog);
+        found.push({
+          sessionId,
+          modelId: run[0]!.row.modelId,
+          startedAt: run[0]!.row.createdAt,
+          steps: run.length,
+          ongoing: end === steps.length,
+          endedAt: run[run.length - 1]!.row.createdAt,
+          cacheRead: base,
+          healthyBefore: steps
+            .slice(0, i)
+            .some(
+              (e) =>
+                e.row.tokens!.input + e.row.tokens!.cacheRead > 0 &&
+                cacheShare(e.row.tokens!) >= LOW_CACHE_READ_RATIO,
+            ),
+          stalledCostMicros: sum(run),
+          ...(savings === undefined ? {} : { estimatedSavingsMicros: savings }),
+          rowIds: run.map((e) => e.row.id),
+        });
+      }
+      i = end;
+    }
+  }
+  return found;
+}
+
+/** Cache stalls in the given rows; the single definition used by every consumer. */
+export function findStalls(
+  rows: readonly CostRow[],
+  catalog: PriceTable,
+): Stall[] {
+  return stallsOf(
+    rows.map((row) => ({ row, micros: row.costMicros, addOnMicros: 0 })),
+    catalog,
+  );
+}
+
+function stalledRowIds(entries: readonly PricedRow[]): Set<string> {
+  return new Set(stallsOf(entries, new Map()).flatMap((s) => s.rowIds));
+}
+
+function clock(epoch: number): string {
+  const d = new Date(epoch);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${dateOf(epoch)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 const inputSide = (row: CostRow): number =>
@@ -674,6 +813,23 @@ export function buildHotspots(input: AnalysisInput, limit: number): Hotspots {
     });
   }
 
+  const stalls = stallsOf(priced.rows, input.catalog);
+  for (const st of topBy(stalls, (x) => x.stalledCostMicros)) {
+    add({
+      type: "cache_stall",
+      scope: st.sessionId,
+      evidence: {
+        metric: "stalledCostMicros",
+        value: st.stalledCostMicros,
+        threshold: STALL_MIN_STEPS,
+      },
+      attributableMicros: st.stalledCostMicros,
+      suggestion: `The cache stopped growing at ${clock(st.startedAt)}, so every step re-bills the whole history; start a fresh session or switch model or route.`,
+      basis: `Runs of at least ${STALL_MIN_STEPS} consecutive steps in one session with at least ${STALL_MIN_INPUT_TOKENS} uncached input tokens, a cache-read share under ${LOW_CACHE_READ_RATIO * 100}% and a cache-read value that stays at the run's first value (at most ${STALL_READ_TOLERANCE * 100}% of input-side tokens above it). Steps without token counts are skipped. Savings bill the stalled input at the catalog cache-read price and are omitted when it is unknown.`,
+      stall: st,
+    });
+  }
+
   for (const [agent, entries] of groupBy(priced.rows, (e) => e.row.agent)) {
     const agentTotal = sum(entries);
     const models = [...groupBy(entries, (e) => e.row.modelId)]
@@ -789,7 +945,7 @@ function header(range: Range, total: number, complete: boolean): string {
 export function renderReport(report: Report): string {
   const lines = [
     header(report.range, report.totalMicros, report.complete),
-    `Grouped by ${report.groupBy}: cost, share, steps, avg/step, tokens in/out/reasoning/cache-read/cache-write, cache-read ratio, failed cost`,
+    `Grouped by ${report.groupBy}: cost, share, steps, avg/step, tokens in/out/reasoning/cache-read/cache-write, cache-read ratio, failed cost, stalled steps (cache stall, shown when above 0)`,
     ...report.groups.map((g) => {
       const t = g.tokens;
       return [
@@ -803,6 +959,7 @@ export function renderReport(report: Report): string {
           ? "cache n/a"
           : `cache ${percent(g.cacheReadRatio)}`,
         `failed ${money(g.failedMicros)}`,
+        ...(g.stalledSteps > 0 ? [`stalled ${g.stalledSteps}`] : []),
       ].join(" | ");
     }),
     ...report.notes.map((n) => `Note: ${n}`),
@@ -828,6 +985,11 @@ export function renderHotspots(hotspots: Hotspots): string {
     lines.push(
       `${i + 1}. ${f.type} [${f.scope}] ${money(f.attributableMicros)} (${percent(f.share)})`,
       `   evidence: ${f.evidence.metric} = ${value}${threshold}`,
+      ...(f.stall
+        ? [
+            `   stall: ${f.stall.steps} steps from ${clock(f.stall.startedAt)} on ${f.stall.modelId}, ${f.stall.ongoing ? "ongoing" : "ended"}, constant cache read ${f.stall.cacheRead}, ${f.stall.healthyBefore ? "healthy before" : "no healthy period before"}, ${f.stall.estimatedSavingsMicros === undefined ? "savings unknown (no cache-read price)" : `est. savings ${money(f.stall.estimatedSavingsMicros)}`}`,
+          ]
+        : []),
       ...(f.suggestion === null ? [] : [`   suggestion: ${f.suggestion}`]),
       `   basis: ${f.basis}`,
     );

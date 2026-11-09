@@ -195,7 +195,7 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
     },
     {
       name: "cost_hotspots",
-      description: `Rank cost hotspots with evidence and suggestions for reducing them: expensive sessions and steps, low cache use, cache writes, failed or truncated steps, compactions, sub-agent fan-out, context growth, rewrites after idle pauses over 5 minutes and each agent's model mix. Attributable costs overlap, so do not add them up; suggestions are heuristics, not guarantees. ${COMMON_DESCRIPTION}`,
+      description: `Rank cost hotspots with evidence and suggestions for reducing them: expensive sessions and steps, low cache use, cache writes, failed or truncated steps, compactions, sub-agent fan-out, context growth, rewrites after idle pauses over 5 minutes, cache stalls (5+ consecutive steps where cache reads stay at the fixed prompt prefix while uncached input grows; shows start time, stalled steps, cost and whether it is ongoing) and each agent's model mix. Attributable costs overlap, so do not add them up; suggestions are heuristics, not guarantees. ${COMMON_DESCRIPTION}`,
       input: {
         type: "object",
         properties: {

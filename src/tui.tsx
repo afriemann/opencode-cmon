@@ -18,12 +18,18 @@ export type FeedState =
   | { readonly kind: "error" }
   | { readonly kind: "ready"; readonly summary: Summary };
 
+export interface CacheStallEvent {
+  readonly sessionID: string;
+  readonly steps: number;
+  readonly wastedMicros: number;
+}
+
 /** The slice of `context.client.rpc(CostRpc)` this module depends on; tests supply a fake. */
 export interface CostRpcClient {
   summary(input: { from: number; to: number }): Promise<unknown>;
   events: {
     on(
-      name: "changed",
+      name: "changed" | "cacheStall",
       handler: (event: { data: unknown }) => void,
     ): () => void;
   };
@@ -87,6 +93,37 @@ export function createCostFeed(
   });
 
   return { state };
+}
+
+/** One-line warning for the first ongoing stall; null when the summary lists none. */
+export function stallLine(state: FeedState): string | null {
+  if (state.kind !== "ready") return null;
+  const stall = state.summary.stalls?.[0];
+  if (!stall) return null;
+  const at = new Date(stall.startedAt);
+  const hhmm = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+  return `⚠ cache stalled ${stall.steps} steps, ~${formatUsd(stall.wastedMicros)} wasted since ${hhmm}`;
+}
+
+export function stallToast(data: unknown): {
+  title: string;
+  message: string;
+  variant: "warning";
+  sessionID?: string;
+} | null {
+  const e = data as Partial<CacheStallEvent> | null;
+  if (
+    !e ||
+    typeof e.steps !== "number" ||
+    typeof e.wastedMicros !== "number"
+  )
+    return null;
+  return {
+    title: "Prompt cache stalled",
+    message: `cache stalled ${e.steps} steps, ~${formatUsd(e.wastedMicros)} wasted; start a fresh session or switch model`,
+    variant: "warning",
+    ...(typeof e.sessionID === "string" ? { sessionID: e.sessionID } : {}),
+  };
 }
 
 export function glyph(open: boolean): string {
@@ -194,7 +231,16 @@ export function toggleSegments(
 }
 
 function useCostBlock(context: Plugin.Context) {
-  const feed = createCostFeed(context.client.rpc(CostRpc));
+  const client = context.client.rpc(CostRpc);
+  const feed = createCostFeed(client);
+  createEffect(() => {
+    onCleanup(
+      client.events.on("cacheStall", (event) => {
+        const toast = stallToast(event.data);
+        if (toast) context.ui.toast.show(toast);
+      }),
+    );
+  });
   return { feed, ...createOpenState(context.storage) };
 }
 
@@ -226,6 +272,11 @@ export function CostSidebar(props: {
           </text>
         </box>
       </box>
+      <Show when={stallLine(feed.state()) !== null}>
+        <text fg={theme.text.feedback.error.base}>
+          {stallLine(feed.state())}
+        </text>
+      </Show>
       <Show when={view.open}>
         <Show when={feed.state().kind === "ready"}>
           <box flexDirection="row" gap={2} paddingLeft={2}>

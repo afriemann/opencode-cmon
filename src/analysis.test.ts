@@ -680,3 +680,137 @@ describe("rendering", () => {
     expect(capText("a\nb")).toBe("a\nb");
   });
 });
+
+describe("cache stalls", () => {
+  const MIN = 60_000;
+  const PREFIX = 36_655;
+  let at = 1_000_000;
+
+  function step(
+    sessionId: string,
+    input: number,
+    cacheRead: number,
+    overrides: Partial<CostRow> = {},
+  ): CostRow {
+    at += MIN;
+    return row({
+      sessionId,
+      createdAt: at,
+      costMicros: 500_000,
+      tokens: { input, cacheRead, cacheWrite: 0 },
+      ...overrides,
+    });
+  }
+
+  const stalled = (sessionId: string, n: number, first = 60_000) =>
+    Array.from({ length: n }, (_, i) =>
+      step(sessionId, first + i * 10_000, PREFIX),
+    );
+  const healthy = (sessionId: string, n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      step(sessionId, 30_000, 50_000 + i * 20_000),
+    );
+  const stalls = (rows: CostRow[], extra: Partial<AnalysisInput> = {}) =>
+    buildHotspots(input(rows, extra), 30).findings.filter(
+      (f) => f.type === "cache_stall",
+    );
+
+  test("Healthy cache is not reported", () => {
+    expect(stalls(healthy("s1", 12))).toEqual([]);
+  });
+
+  test("Stall from the first step is ongoing", () => {
+    const [finding] = stalls(stalled("s1", 6));
+    expect(finding?.stall).toMatchObject({
+      sessionId: "s1",
+      steps: 6,
+      ongoing: true,
+      cacheRead: PREFIX,
+      healthyBefore: false,
+    });
+  });
+
+  test("Healthy then stalled", () => {
+    const rows = [...healthy("s1", 10), ...stalled("s1", 8)];
+    const [finding] = stalls(rows);
+    expect(finding?.stall).toMatchObject({
+      startedAt: rows[10]!.createdAt,
+      steps: 8,
+      ongoing: true,
+      healthyBefore: true,
+      stalledCostMicros: 4_000_000,
+    });
+    expect(finding?.attributableMicros).toBe(4_000_000);
+  });
+
+  test("A cache miss below the constant read does not end the stall", () => {
+    const rows = stalled("s1", 6);
+    rows.splice(3, 0, step("s1", 268_637, 0));
+    expect(stalls(rows)[0]?.stall).toMatchObject({ steps: 7, ongoing: true });
+  });
+
+  test("A model that never caches is not a stall", () => {
+    const rows = Array.from({ length: 6 }, () => step("s1", 100_000, 0));
+    expect(stalls(rows)).toEqual([]);
+  });
+
+  test("Short run is not reported", () => {
+    expect(stalls(stalled("s1", 4))).toEqual([]);
+  });
+
+  test("Recovered stall is not ongoing", () => {
+    const rows = [...stalled("s1", 6), step("s1", 30_000, 200_000)];
+    expect(stalls(rows)[0]?.stall).toMatchObject({
+      steps: 6,
+      ongoing: false,
+    });
+  });
+
+  test("Unknown tokens are skipped and sessions are independent", () => {
+    const rows = stalled("s1", 6);
+    rows.splice(3, 0, step("s1", 0, 0, { tokens: null }));
+    rows.push(...healthy("s2", 8));
+    const found = stalls(rows);
+    expect(found.map((f) => f.scope)).toEqual(["s1"]);
+    expect(found[0]?.stall?.steps).toBe(6);
+  });
+
+  test("Small cache-read growth within tolerance stays a stall", () => {
+    const rows = Array.from({ length: 5 }, (_, i) =>
+      step("s1", 100_000, PREFIX + i * 100),
+    );
+    expect(stalls(rows)).toHaveLength(1);
+  });
+
+  test("Savings are omitted without a cache-read price", () => {
+    expect(stalls(stalled("s1", 6))[0]?.stall).not.toHaveProperty(
+      "estimatedSavingsMicros",
+    );
+  });
+
+  test("Savings use the catalog cache-read price", () => {
+    const rows = Array.from({ length: 5 }, () =>
+      step("s1", 1_000_000, PREFIX, {
+        providerId: "github-copilot",
+        modelId: "claude-sonnet-5.5",
+      }),
+    );
+    // (2 - 0.2) USD per million over 1M input tokens, five steps.
+    expect(
+      stalls(rows, { catalog: CATALOG })[0]?.stall?.estimatedSavingsMicros,
+    ).toBe(9_000_000);
+  });
+
+  test("Report counts stalled steps per model", () => {
+    const rows = [
+      ...stalled("s1", 6).map((r) => ({ ...r, modelId: "m-stall" })),
+      ...healthy("s2", 3),
+    ];
+    const grouped = report(rows, { groupBy: "model" }).groups;
+    expect(grouped.find((g) => g.key === "m-stall")?.stalledSteps).toBe(6);
+    expect(grouped.find((g) => g.key === "m-a")?.stalledSteps).toBe(0);
+    expect(renderReport(report(rows, { groupBy: "model" }))).toContain(
+      "stalled 6",
+    );
+  });
+});

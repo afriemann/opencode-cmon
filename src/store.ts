@@ -557,6 +557,17 @@ export class Store {
     return read.deferred();
   }
 
+  /** Step rows of one session created at or after `since`, oldest first; read-only. */
+  sessionSteps(sessionId: string, since: number): CostRow[] {
+    return this.filteredRows({
+      from: since,
+      to: Number.MAX_SAFE_INTEGER,
+      session: sessionId,
+      includeSubagents: false,
+      kind: "step",
+    }).rows;
+  }
+
   /**
    * Milliseconds since the previous step of the same session for each row (null when none). The
    * predecessor is looked up among all of the session's steps, so filters never lengthen a gap.

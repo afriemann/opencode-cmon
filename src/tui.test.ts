@@ -8,6 +8,8 @@ import plugin, {
   createCostFeed,
   createOpenState,
   footerLine,
+  stallLine,
+  stallToast,
   amount,
   glyph,
   type CostRpcClient,
@@ -401,5 +403,44 @@ describe("footer and placement", () => {
       const older = { ...SUMMARY, complete: undefined } as unknown as Summary;
       expect(amount({ kind: "ready", summary: older })).toBe("$12.34");
     });
+  });
+});
+
+describe("cache stall warnings", () => {
+  const stalled = (steps: number): FeedState => ({
+    kind: "ready",
+    summary: {
+      ...SUMMARY,
+      stalls: [
+        {
+          sessionId: "s1",
+          steps,
+          wastedMicros: 165_000_000,
+          startedAt: new Date(2026, 10, 9, 1, 46).getTime(),
+        },
+      ],
+    },
+  });
+
+  test("Warning line for an ongoing stall", () => {
+    expect(stallLine(stalled(496))).toBe(
+      "⚠ cache stalled 496 steps, ~$165.00 wasted since 01:46",
+    );
+  });
+
+  test("Warning line without stalls", () => {
+    expect(stallLine({ kind: "ready", summary: SUMMARY })).toBeNull();
+    expect(stallLine({ kind: "loading" })).toBeNull();
+  });
+
+  test("Toast on event", () => {
+    expect(
+      stallToast({ sessionID: "s1", steps: 5, wastedMicros: 2_500_000 }),
+    ).toMatchObject({
+      variant: "warning",
+      sessionID: "s1",
+      message: expect.stringContaining("cache stalled 5 steps, ~$2.50"),
+    });
+    expect(stallToast({})).toBeNull();
   });
 });

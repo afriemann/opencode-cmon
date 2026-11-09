@@ -48,6 +48,13 @@ export interface ProviderTotal {
   readonly micros: number;
 }
 
+export interface StallSummary {
+  readonly sessionId: string;
+  readonly steps: number;
+  readonly wastedMicros: number;
+  readonly startedAt: number;
+}
+
 export interface Summary {
   readonly revision: number;
   readonly totalMicros: number;
@@ -56,6 +63,8 @@ export interface Summary {
   readonly providers: readonly ProviderTotal[];
   /** False when some row that could carry a cache-write cost could not be priced. */
   readonly complete: boolean;
+  /** Ongoing cache stalls, highest wasted cost first; absent on servers without stall detection. */
+  readonly stalls?: readonly StallSummary[];
 }
 
 /** A row that may carry a cache-write cost, priced in code at read time. */

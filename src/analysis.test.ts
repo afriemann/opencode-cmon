@@ -350,6 +350,85 @@ const MIN = 60_000;
 const gapsOf = (entries: Array<[CostRow, number | null]>) =>
   new Map(entries.map(([r, g]) => [r.id, g]));
 
+describe("two-dimension grouping", () => {
+  const day1 = new Date(2026, 9, 1, 12).getTime();
+  const day2 = new Date(2026, 9, 2, 12).getTime();
+
+  test("Group by day and model", () => {
+    const rows = [
+      row({ modelId: "a", createdAt: day1, costMicros: 1_000_000 }),
+      row({ modelId: "b", createdAt: day1, costMicros: 2_000_000 }),
+      row({ modelId: "a", createdAt: day2, costMicros: 3_000_000 }),
+      row({ modelId: "a", createdAt: day2, costMicros: 1_000_000 }),
+    ];
+    const result = report(rows, { groupBy: ["day", "model"] });
+    expect(result.groupBy).toEqual(["day", "model"]);
+    expect(
+      result.groups.map((g) => [g.key, "keys" in g ? g.keys : undefined]),
+    ).toEqual([
+      ["2026-10-02 / a", ["2026-10-02", "a"]],
+      ["2026-10-01 / b", ["2026-10-01", "b"]],
+      ["2026-10-01 / a", ["2026-10-01", "a"]],
+    ]);
+    expect(result.groups[0]).toMatchObject({ micros: 4_000_000, steps: 2 });
+    expect(result.groups.reduce((s, g) => s + g.share, 0)).toBeCloseTo(1);
+  });
+
+  test("Group by day and model keeps the cache-read ratio", () => {
+    const rows = [
+      row({
+        modelId: "a",
+        tokens: { input: 100, cacheRead: 300, cacheWrite: 0 },
+      }),
+    ];
+    expect(report(rows, { groupBy: ["model", "day"] }).groups[0]).toMatchObject(
+      { cacheReadRatio: 0.75 },
+    );
+  });
+
+  test("A single dimension is unchanged", () => {
+    const rows = [
+      row({ modelId: "a", createdAt: day1 }),
+      row({ modelId: "b", createdAt: day2, costMicros: 2_000_000 }),
+    ];
+    const single = report(rows, { groupBy: "model" });
+    expect(single.groupBy).toBe("model");
+    expect(single.groups.every((g) => !("keys" in g))).toBe(true);
+    expect(JSON.stringify(single)).not.toContain("keys");
+    expect(renderReport(single)).toContain("Grouped by model:");
+  });
+
+  test("Limit applies to combinations", () => {
+    const rows = [
+      row({ modelId: "a", createdAt: day1, costMicros: 3_000_000 }),
+      row({ modelId: "b", createdAt: day1, costMicros: 2_000_000 }),
+      row({ modelId: "a", createdAt: day2, costMicros: 1_000_000 }),
+    ];
+    const result = report(rows, { groupBy: ["day", "model"], limit: 2 });
+    expect(result.groups.map((g) => g.key)).toEqual([
+      "2026-10-01 / a",
+      "2026-10-01 / b",
+      "others",
+    ]);
+    expect(result.groups[2]?.micros).toBe(1_000_000);
+    expect(result.groups.reduce((s, g) => s + g.share, 0)).toBeCloseTo(1);
+  });
+
+  test("gap combined with another dimension uses cost order", () => {
+    const rows = [row({ modelId: "a" })];
+    const result = report(rows, { groupBy: ["gap", "model"] });
+    expect(result.groups.map((g) => g.key)).toEqual(["first / a"]);
+  });
+
+  test("the rendering names both dimensions", () => {
+    const text = renderReport(
+      report([row({ modelId: "a" })], { groupBy: ["agent", "model"] }),
+    );
+    expect(text).toContain("Grouped by agent, model:");
+    expect(text).toContain("build / a |");
+  });
+});
+
 describe("gap analysis", () => {
   test("Group by gap uses fixed ordered buckets", () => {
     const rows = [row(), row(), row(), row()];

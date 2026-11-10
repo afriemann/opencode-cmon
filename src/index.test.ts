@@ -783,6 +783,7 @@ describe("plugin", () => {
       const f = fakeContext();
       await start(f.ctx);
       expect([...f.registeredTools.keys()].sort()).toEqual([
+        "cache_breaks",
         "cost_hotspots",
         "cost_report",
       ]);
@@ -806,7 +807,7 @@ describe("plugin", () => {
         transform!(f.toolEditor);
         transform!(f.toolEditor);
       }).not.toThrow();
-      expect(f.registeredTools.size).toBe(2);
+      expect(f.registeredTools.size).toBe(3);
     });
 
     test("a tool reads the recorded cost", async () => {

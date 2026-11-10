@@ -764,7 +764,7 @@ describe("store", () => {
         .all() as Array<{ detail: string }>;
       raw.close();
       expect(plan.map((p) => p.detail).join(" ")).toContain(
-        "USING COVERING INDEX",
+        "USING COVERING INDEX cost_entry_session_kind_created",
       );
     });
   });

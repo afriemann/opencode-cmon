@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { Store } from "./store";
+import { GAP_BATCH_SESSIONS, Store } from "./store";
 import type { CostRow } from "./types";
 
 let dir: string;
@@ -698,12 +698,12 @@ describe("store", () => {
   describe("step gaps", () => {
     const FILTER = { from: 0, to: 10_000_000 };
 
-    test("stepGaps measures the time to the previous step", () => {
+    test("stepGaps measures the time to the previous step", async () => {
       const store = open();
       store.upsertLive(row({ id: "a", createdAt: 1_000 }));
       store.upsertLive(row({ id: "b", createdAt: 31_000 }));
       const { rows } = store.filteredRows(FILTER);
-      expect(store.stepGaps(rows)).toEqual(
+      expect(await store.stepGaps(rows)).toEqual(
         new Map([
           ["a", null],
           ["b", 30_000],
@@ -711,16 +711,16 @@ describe("store", () => {
       );
     });
 
-    test("stepGaps ignores filters", () => {
+    test("stepGaps ignores filters", async () => {
       const store = open();
       store.upsertLive(row({ id: "a", agent: "x", createdAt: 1_000 }));
       store.upsertLive(row({ id: "b", agent: "y", createdAt: 61_000 }));
       store.upsertLive(row({ id: "c", agent: "x", createdAt: 121_000 }));
       const { rows } = store.filteredRows({ ...FILTER, agent: "x" });
-      expect(store.stepGaps(rows).get("c")).toBe(60_000);
+      expect((await store.stepGaps(rows)).get("c")).toBe(60_000);
     });
 
-    test("stepGaps skips compactions as predecessors", () => {
+    test("stepGaps skips compactions as predecessors", async () => {
       const store = open();
       store.upsertLive(row({ id: "a", createdAt: 1_000 }));
       store.upsertLive(
@@ -728,15 +728,44 @@ describe("store", () => {
       );
       store.upsertLive(row({ id: "b", createdAt: 601_000 }));
       const { rows } = store.filteredRows(FILTER);
-      expect(store.stepGaps(rows).get("b")).toBe(600_000);
+      expect((await store.stepGaps(rows)).get("b")).toBe(600_000);
     });
 
-    test("Gaps stay within a session", () => {
+    test("Gaps stay within a session", async () => {
       const store = open();
       store.upsertLive(row({ id: "a", sessionId: "s1", createdAt: 1_000 }));
       store.upsertLive(row({ id: "b", sessionId: "s2", createdAt: 5_000 }));
       const { rows } = store.filteredRows(FILTER);
-      expect(store.stepGaps(rows).get("b")).toBeNull();
+      expect((await store.stepGaps(rows)).get("b")).toBeNull();
+    });
+
+    test("Other work runs during a call over many sessions", async () => {
+      const store = open();
+      for (let i = 0; i <= GAP_BATCH_SESSIONS; i++)
+        store.upsertLive(
+          row({ id: `m${i}`, sessionId: `s${i}`, createdAt: 1_000 + i }),
+        );
+      const { rows } = store.filteredRows(FILTER);
+      let ran = false;
+      setImmediate(() => {
+        ran = true;
+      });
+      await store.stepGaps(rows);
+      expect(ran).toBe(true);
+    });
+
+    test("Gap lookup stays fast with a large ledger", () => {
+      open();
+      const raw = new Database(dbPath, { readonly: true });
+      const plan = raw
+        .query(
+          "EXPLAIN QUERY PLAN SELECT created_at FROM cost_entry WHERE session_id = 's' AND kind = 'step' ORDER BY created_at",
+        )
+        .all() as Array<{ detail: string }>;
+      raw.close();
+      expect(plan.map((p) => p.detail).join(" ")).toContain(
+        "USING COVERING INDEX cost_entry_session_kind_created",
+      );
     });
   });
 

@@ -148,7 +148,7 @@ async function loadInput(
       rows,
       unknownDirectory,
       gaps: needGaps(args)
-        ? store.stepGaps([...rows, ...unknownDirectory])
+        ? await store.stepGaps([...rows, ...unknownDirectory])
         : new Map(),
       projectFiltered: project !== undefined,
       catalog: deps.catalog(),

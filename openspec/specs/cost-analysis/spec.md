@@ -1,6 +1,7 @@
 # cost-analysis Specification
 
 ## Purpose
+
 Lets agents read the recorded cost to find where money goes and what to look at to reduce it, through two bounded read-only tools over the local cost ledger.
 
 ## Requirements
@@ -429,3 +430,17 @@ The tools SHALL return structured output and compact text with the same facts, a
 - **GIVEN** a model whose session has a six-step cache stall
 - **WHEN** the report is grouped by model
 - **THEN** that model's line shows six stalled steps and a model without a stall shows none
+
+### Requirement: Tool calls keep the server responsive
+
+Cost tools SHALL NOT block the server's event loop for the duration of a call; other work scheduled on the server MUST be able to run while a call loads its data.
+
+#### Scenario: Other work runs during a call over many sessions
+
+- **WHEN** a tool call loads gaps for rows from many sessions
+- **THEN** work scheduled on the event loop runs before the call completes
+
+#### Scenario: Gap lookup stays fast with a large ledger
+
+- **WHEN** the ledger holds thousands of sessions and a gap lookup runs
+- **THEN** each session's step times are found through an index, not a full table scan

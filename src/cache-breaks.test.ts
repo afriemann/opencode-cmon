@@ -250,6 +250,7 @@ describe("cache breaks estimate the waste", () => {
     const [found] = run(rows).flagged;
     // 30 steps x 10000 input x (2 - 0.2) micro-USD per token
     expect(found?.estimatedWasteMicros).toBe(540_000);
+    expect(renderCacheBreaks(run(rows))).toContain("est. waste: $0.54");
   });
 
   test("Unknown price omits the estimate", () => {
@@ -310,10 +311,34 @@ describe("cache breaks list flagged sessions and a model summary", () => {
   });
 
   test("The output carries no message content", () => {
-    const text = JSON.stringify(run(frozen("a", 1)));
-    expect(Object.keys(JSON.parse(text).flagged[0]).sort()).not.toContain(
-      "prompt",
+    const result = run(frozen("a", 1));
+    expect(Object.keys(result.flagged[0]!).sort()).toEqual([
+      "agent",
+      "cacheRatio",
+      "changePoints",
+      "frozen",
+      "fullMisses",
+      "model",
+      "provider",
+      "sessionId",
+      "steps",
+      "totalMicros",
+      "wasteOmitted",
+    ]);
+    expect(renderCacheBreaks(result)).toContain("frozen");
+  });
+});
+
+describe("cache breaks without frozen or missed steps", () => {
+  test("a change-point-only session omits the waste with a reason", () => {
+    const rows = session(
+      45,
+      (i) => (i >= 15 && i < 30 ? 3_000 + i : 90_000 + i * 100),
+      (i) => (i >= 15 && i < 30 ? 7_000 : 10_000),
     );
-    expect(renderCacheBreaks(run(frozen("a", 1)))).toContain("frozen");
+    const found = run(rows).flagged[0];
+    expect(found?.fullMisses.count).toBe(0);
+    expect(found?.estimatedWasteMicros).toBeUndefined();
+    expect(found?.wasteOmitted).toMatch(/no frozen or full-miss/);
   });
 });

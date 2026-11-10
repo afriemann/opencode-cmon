@@ -10,7 +10,6 @@
 
 - Ratio is cacheRead/(cacheRead+input). `cost_report`'s `cacheReadRatio` also counts cache writes. The difference is intentional: this ratio asks whether the prompt prefix was reused, and writes would mask a miss.
 - The timeline is ordered by createdAt, then id (a stable tiebreak). Steps are kind step with non-null tokens. Compaction rows stay only so the step right after one is excluded, because compaction legitimately resets the cache. Null-token rows are counted in a note.
--
 - A session is flagged on a frozen run >=15, any full miss, or any change-point. The change-point signal is a rolling 10-step ratio crossing below 0.5, evaluated from step 10. Listed misses and change-points are capped at 10 per session.
 - Thresholds are named constants, like `STALL_MIN_STEPS`.
 

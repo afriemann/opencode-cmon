@@ -201,13 +201,13 @@ describe("cost tools", () => {
     expect(result.output).toMatchObject({ groups: [{ key: "first / build" }] });
   });
 
-  test("duplicate groupBy dimensions are rejected", async () => {
+  test("Duplicate dimensions are rejected", async () => {
     await expect(
       call("cost_report", { groupBy: ["day", "day"] }),
     ).rejects.toThrow(/differ/);
   });
 
-  test("three groupBy dimensions are rejected", async () => {
+  test("Three dimensions are rejected", async () => {
     await expect(
       call("cost_report", { groupBy: ["day", "model", "agent"] }),
     ).rejects.toThrow(/exactly two/);
@@ -339,4 +339,8 @@ describe("cache_breaks tool", () => {
   test("a limit above 30 is rejected", async () => {
     await expect(call("cache_breaks", { limit: 31 })).rejects.toThrow(/30/);
   });
+});
+
+test("cache_breaks rejects a kind filter", async () => {
+  await expect(call("cache_breaks", { kind: "step" })).rejects.toThrow(/kind/);
 });

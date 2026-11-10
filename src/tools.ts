@@ -134,8 +134,11 @@ async function loadInput(
   raw: unknown,
   sessionID: string,
   needGaps: (args: Record<string, unknown>) => boolean,
+  rejectKind = false,
 ): Promise<{ args: Record<string, unknown>; input: AnalysisInput }> {
   const args = record(raw);
+  if (rejectKind && args.kind !== undefined)
+    throw new Error("kind is not supported by this tool.");
   const now = deps.now();
   const range = parsePeriod(text(args, "period"), now);
   let project = text(args, "project");
@@ -276,6 +279,7 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
           raw,
           context.sessionID,
           () => false,
+          true,
         );
         const result = buildCacheBreaks(
           input,

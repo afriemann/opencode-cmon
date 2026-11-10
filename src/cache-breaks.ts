@@ -211,6 +211,8 @@ function wasteOf(
   flaggedIndexes: ReadonlySet<number>,
   catalog: AnalysisInput["catalog"],
 ): { micros: number } | { omitted: string } {
+  if (flaggedIndexes.size === 0)
+    return { omitted: "no frozen or full-miss steps to price" };
   const tierOf = (step: Step) => {
     const { row } = step.entry;
     const model = catalog.get(priceKey(row.providerId, row.modelId));

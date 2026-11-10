@@ -41,6 +41,9 @@ export interface StoreOptions {
 /** Bumped whenever the on-disk schema changes. */
 export const CURRENT_SCHEMA_VERSION = 3;
 
+/** Sessions whose step times are read before `stepGaps` yields to the event loop. */
+export const GAP_BATCH_SESSIONS = 50;
+
 const TOKEN_COLUMNS = [
   "tokens_input",
   "tokens_cache_read",
@@ -129,6 +132,10 @@ CREATE TABLE IF NOT EXISTS cost_entry (
 CREATE INDEX IF NOT EXISTS cost_entry_created_at ON cost_entry(created_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `;
+
+// Serves `stepGaps`; created on every open so existing databases gain it without a schema version bump.
+const SESSION_STEP_INDEX =
+  "CREATE INDEX IF NOT EXISTS cost_entry_session_kind_created ON cost_entry(session_id, kind, created_at)";
 
 const INSERT_COLUMNS = `(id, session_id, parent_session_id, agent, provider_id, model_id, kind, failed, cost_micros, tokens_input, tokens_cache_read, tokens_cache_write, tokens_output, tokens_reasoning, finish, directory, details_checked, created_at, source)
 VALUES ($id, $sessionId, $parentSessionId, $agent, $providerId, $modelId, $kind, $failed, $costMicros, $tokensInput, $tokensCacheRead, $tokensCacheWrite, $tokensOutput, $tokensReasoning, $finish, $directory, $detailsChecked, $createdAt, $source)`;
@@ -250,6 +257,7 @@ export class Store {
   private migrate(): void {
     if (this.schemaVersion() !== CURRENT_SCHEMA_VERSION) this.migrateVersion();
     this.ensureDetailColumns();
+    this.db.run(SESSION_STEP_INDEX);
   }
 
   private columnNames(): Set<string> {
@@ -572,20 +580,26 @@ export class Store {
    * Milliseconds since the previous step of the same session for each row (null when none). The
    * predecessor is looked up among all of the session's steps, so filters never lengthen a gap.
    */
-  stepGaps(rows: readonly CostRow[]): Map<string, number | null> {
+  async stepGaps(
+    rows: readonly CostRow[],
+  ): Promise<Map<string, number | null>> {
     const gaps = new Map<string, number | null>();
     const sessions = [...new Set(rows.map((row) => row.sessionId))];
     const query = this.db.query(
       "SELECT created_at FROM cost_entry WHERE session_id = $session AND kind = 'step' ORDER BY created_at",
     );
     const stepTimes = new Map<string, number[]>();
-    for (const session of sessions)
+    for (const [index, session] of sessions.entries()) {
+      // Yield so a call over many sessions never holds the event loop.
+      if (index > 0 && index % GAP_BATCH_SESSIONS === 0)
+        await new Promise<void>((resolve) => setImmediate(resolve));
       stepTimes.set(
         session,
         (query.all({ $session: session }) as Array<{ created_at: number }>).map(
           (entry) => entry.created_at,
         ),
       );
+    }
     for (const row of rows) {
       const times = stepTimes.get(row.sessionId) ?? [];
       // Largest step time strictly before this row (times are ascending).

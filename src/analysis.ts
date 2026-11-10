@@ -55,6 +55,7 @@ export interface Range {
 
 export type GroupBy =
   "agent" | "model" | "provider" | "session" | "day" | "gap";
+export type GroupSpec = GroupBy | readonly [GroupBy, GroupBy];
 export type SortBy = "cost" | "steps" | "avgCost";
 
 export interface AnalysisInput {
@@ -133,7 +134,7 @@ export function validateLimit(limit: number | undefined, max: number): number {
   return limit;
 }
 
-interface PricedRow {
+export interface PricedRow {
   readonly row: CostRow;
   /** opencode's cost plus the cache-write add-on. */
   readonly micros: number;
@@ -141,13 +142,13 @@ interface PricedRow {
   readonly addOnMicros: number;
 }
 
-interface Priced {
+export interface Priced {
   readonly rows: PricedRow[];
   /** Rows whose cache-write add-on could not be priced. */
   readonly unpricedRows: number;
 }
 
-function price(rows: readonly CostRow[], catalog: PriceTable): Priced {
+export function price(rows: readonly CostRow[], catalog: PriceTable): Priced {
   let unpricedRows = 0;
   const priced = rows.map((row): PricedRow => {
     const addOn = rowAddOn(row, catalog);
@@ -173,7 +174,7 @@ function dateOf(epoch: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-function notesFor(
+export function notesFor(
   input: AnalysisInput,
   unpricedRows: number,
   excluded: { rows: number; micros: number } | undefined,
@@ -195,7 +196,7 @@ function notesFor(
   return notes;
 }
 
-function excludedOf(input: AnalysisInput) {
+export function excludedOf(input: AnalysisInput) {
   if (!input.projectFiltered) return undefined;
   const unknown = price(input.unknownDirectory, input.catalog);
   return { rows: unknown.rows.length, micros: sum(unknown.rows) };
@@ -211,6 +212,8 @@ export interface TokenSums {
 
 export interface GroupStats {
   readonly key: string;
+  /** The value per grouping dimension; present only for a two-dimension grouping. */
+  readonly keys?: readonly [string, string];
   readonly micros: number;
   readonly share: number;
   readonly steps: number;
@@ -226,7 +229,7 @@ export interface GroupStats {
 
 export interface Report {
   readonly range: Range;
-  readonly groupBy: GroupBy;
+  readonly groupBy: GroupSpec;
   readonly totalMicros: number;
   readonly complete: boolean;
   readonly groups: GroupStats[];
@@ -238,6 +241,18 @@ function gapBucket(gap: number | null | undefined): string {
   if (gap === null || gap === undefined) return "first";
   if (gap < FAST_GAP_MS) return "<1m";
   return gap <= CACHE_TTL_MS ? "1-5m" : ">5m";
+}
+
+const KEY_SEPARATOR = " / ";
+
+function keysOf(
+  row: CostRow,
+  spec: GroupSpec,
+  gaps: AnalysisInput["gaps"],
+): string[] {
+  return (typeof spec === "string" ? [spec] : spec).map((dimension) =>
+    keyOf(row, dimension, gaps),
+  );
 }
 
 function keyOf(
@@ -266,6 +281,7 @@ function statsOf(
   entries: readonly PricedRow[],
   total: number,
   stalledIds: ReadonlySet<string>,
+  keys?: readonly [string, string],
 ): GroupStats {
   const tokens = {
     input: 0,
@@ -289,6 +305,7 @@ function statsOf(
   const cacheTokens = tokens.cacheRead + tokens.cacheWrite;
   return {
     key,
+    ...(keys ? { keys } : {}),
     micros,
     share: total === 0 ? 0 : micros / total,
     steps,
@@ -312,17 +329,29 @@ const SORTS: Record<SortBy, (g: GroupStats) => number> = {
 
 export function buildReport(
   input: AnalysisInput,
-  options: { groupBy: GroupBy; sort: SortBy; limit: number },
+  options: { groupBy: GroupSpec; sort: SortBy; limit: number },
 ): Report {
   const priced = price(input.rows, input.catalog);
   const total = sum(priced.rows);
-  const buckets = groupBy(priced.rows, (entry) =>
-    keyOf(entry.row, options.groupBy, input.gaps),
-  );
+  const paired = typeof options.groupBy !== "string";
+  const bucketKey = (entry: PricedRow): string =>
+    keysOf(entry.row, options.groupBy, input.gaps).join(KEY_SEPARATOR);
+  const buckets = groupBy(priced.rows, bucketKey);
   const metric = SORTS[options.sort];
   const stalledIds = stalledRowIds(priced.rows);
   const all = [...buckets].map(([key, entries]) =>
-    statsOf(key, entries, total, stalledIds),
+    statsOf(
+      key,
+      entries,
+      total,
+      stalledIds,
+      paired
+        ? (keysOf(entries[0]!.row, options.groupBy, input.gaps) as [
+            string,
+            string,
+          ])
+        : undefined,
+    ),
   );
   const bucketOrder = (key: string): number =>
     (GAP_BUCKETS as readonly string[]).indexOf(key);
@@ -336,9 +365,7 @@ export function buildReport(
   const groups = [...kept];
   if (rest.length > 0) {
     const restKeys = new Set(rest.map((g) => g.key));
-    const entries = priced.rows.filter((e) =>
-      restKeys.has(keyOf(e.row, options.groupBy, input.gaps)),
-    );
+    const entries = priced.rows.filter((e) => restKeys.has(bucketKey(e)));
     groups.push(statsOf("others", entries, total, stalledIds));
   }
   const excluded = excludedOf(input);
@@ -446,7 +473,6 @@ function groupBy<T>(
   return map;
 }
 
-
 export interface Stall {
   readonly sessionId: string;
   readonly modelId: string;
@@ -485,10 +511,7 @@ function stallSavings(
   return Math.round(savings);
 }
 
-function stallsOf(
-  entries: readonly PricedRow[],
-  catalog: PriceTable,
-): Stall[] {
+function stallsOf(entries: readonly PricedRow[], catalog: PriceTable): Stall[] {
   const found: Stall[] = [];
   const sessions = groupBy(
     entries.filter((e) => e.row.kind === "step" && e.row.tokens !== null),
@@ -565,7 +588,7 @@ function stalledRowIds(entries: readonly PricedRow[]): Set<string> {
   return new Set(stallsOf(entries, new Map()).flatMap((s) => s.rowIds));
 }
 
-function clock(epoch: number): string {
+export function clock(epoch: number): string {
   const d = new Date(epoch);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${dateOf(epoch)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -937,7 +960,7 @@ export function capText(text: string): string {
   return `${cut}\n${TRUNCATION_MARKER}`;
 }
 
-function header(range: Range, total: number, complete: boolean): string {
+export function header(range: Range, total: number, complete: boolean): string {
   const approx = complete ? "" : "~";
   return `Period ${day(range.from)} to ${day(range.to - 1)}, total ${approx}${money(total)}${complete ? "" : " (incomplete)"}`;
 }
@@ -945,7 +968,7 @@ function header(range: Range, total: number, complete: boolean): string {
 export function renderReport(report: Report): string {
   const lines = [
     header(report.range, report.totalMicros, report.complete),
-    `Grouped by ${report.groupBy}: cost, share, steps, avg/step, tokens in/out/reasoning/cache-read/cache-write, cache-read ratio, failed cost, stalled steps (cache stall, shown when above 0)`,
+    `Grouped by ${typeof report.groupBy === "string" ? report.groupBy : report.groupBy.join(", ")}: cost, share, steps, avg/step, tokens in/out/reasoning/cache-read/cache-write, cache-read ratio, failed cost, stalled steps (cache stall, shown when above 0)`,
     ...report.groups.map((g) => {
       const t = g.tokens;
       return [

@@ -80,6 +80,7 @@ describe("cost tools", () => {
       now: () => NOW,
     });
     expect(list.map((t) => t.name).sort()).toEqual([
+      "cache_breaks",
       "cost_hotspots",
       "cost_report",
     ]);
@@ -178,6 +179,46 @@ describe("cost tools", () => {
     expect(keys(result)).toEqual(["first", ">5m"]);
   });
 
+  test("a groupBy pair returns one row per combination", async () => {
+    store.upsertLive(row({ id: "a", modelId: "x" }));
+    store.upsertLive(row({ id: "b", modelId: "y" }));
+    const result = await call("cost_report", {
+      period: "2026-10",
+      groupBy: ["agent", "model"],
+    });
+    expect(result.output).toMatchObject({
+      groupBy: ["agent", "model"],
+      groups: [{ key: "build / x" }, { key: "build / y" }],
+    });
+  });
+
+  test("a groupBy pair with gap loads the gaps", async () => {
+    store.upsertLive(row({ id: "a" }));
+    const result = await call("cost_report", {
+      period: "2026-10",
+      groupBy: ["gap", "agent"],
+    });
+    expect(result.output).toMatchObject({ groups: [{ key: "first / build" }] });
+  });
+
+  test("Duplicate dimensions are rejected", async () => {
+    await expect(
+      call("cost_report", { groupBy: ["day", "day"] }),
+    ).rejects.toThrow(/differ/);
+  });
+
+  test("Three dimensions are rejected", async () => {
+    await expect(
+      call("cost_report", { groupBy: ["day", "model", "agent"] }),
+    ).rejects.toThrow(/exactly two/);
+  });
+
+  test("an unknown dimension inside a groupBy pair is rejected", async () => {
+    await expect(
+      call("cost_report", { groupBy: ["day", "nope"] }),
+    ).rejects.toThrow(/groupBy/);
+  });
+
   test("an unknown groupBy is rejected", async () => {
     await expect(call("cost_report", { groupBy: "nope" })).rejects.toThrow(
       /groupBy/,
@@ -263,7 +304,11 @@ describe("cache stall findings through the tool", () => {
         row({
           id: `st${i}`,
           createdAt: base + i * 60_000,
-          tokens: { input: 60_000 + i * 10_000, cacheRead: 36_655, cacheWrite: 0 },
+          tokens: {
+            input: 60_000 + i * 10_000,
+            cacheRead: 36_655,
+            cacheWrite: 0,
+          },
         }),
       );
     const result = await call("cost_hotspots");
@@ -271,4 +316,31 @@ describe("cache stall findings through the tool", () => {
     expect(result.content).toContain("6 steps");
     expect(result.content).toContain("ongoing");
   });
+});
+
+describe("cache_breaks tool", () => {
+  test("it returns structured output and matching text", async () => {
+    for (let i = 0; i < 25; i += 1)
+      store.upsertLive(
+        row({
+          id: `f${i}`,
+          createdAt: NOW.getTime() - (30 - i) * 1000,
+          tokens: { input: 1000 + i, cacheRead: 45_274, cacheWrite: 0 },
+        }),
+      );
+    const result = await call("cache_breaks", { period: "2026-10" });
+    expect(result.output).toMatchObject({
+      sessionsExamined: 1,
+      flagged: [{ frozen: { steps: 25, cacheRead: 45_274 } }],
+    });
+    expect(result.content).toContain("frozen: 25 steps");
+  });
+
+  test("a limit above 30 is rejected", async () => {
+    await expect(call("cache_breaks", { limit: 31 })).rejects.toThrow(/30/);
+  });
+});
+
+test("cache_breaks rejects a kind filter", async () => {
+  await expect(call("cache_breaks", { kind: "step" })).rejects.toThrow(/kind/);
 });

@@ -10,8 +10,14 @@ import {
   validateLimit,
   type AnalysisInput,
   type GroupBy,
+  type GroupSpec,
   type SortBy,
 } from "./analysis";
+import {
+  buildCacheBreaks,
+  CACHE_BREAKS_MAX_LIMIT,
+  renderCacheBreaks,
+} from "./cache-breaks";
 import type { PriceTable } from "./pricing";
 import type { RowFilter, Store } from "./store";
 import type { EntryKind } from "./types";
@@ -71,6 +77,10 @@ const FILTER_PROPERTIES = {
   project: { type: "string", description: "Absolute directory, or `current`" },
 } as const;
 
+const FILTER_PROPERTIES_NO_KIND = Object.fromEntries(
+  Object.entries(FILTER_PROPERTIES).filter(([key]) => key !== "kind"),
+);
+
 function limitProperty(max: number) {
   return {
     type: "integer",
@@ -105,13 +115,30 @@ function choice<T extends string>(
   return value as T;
 }
 
+function groupSpec(args: Record<string, unknown>): GroupSpec {
+  const value = args.groupBy;
+  if (value === undefined) return "agent";
+  if (!Array.isArray(value)) return choice(args, "groupBy", GROUP_BY)!;
+  if (value.length !== 2)
+    throw new Error("groupBy must be one dimension or exactly two dimensions.");
+  const pair = value.map((_, i) =>
+    choice({ groupBy: value[i] }, "groupBy", GROUP_BY),
+  ) as [GroupBy, GroupBy];
+  if (pair[0] === pair[1])
+    throw new Error("The two groupBy dimensions must differ.");
+  return pair;
+}
+
 async function loadInput(
   deps: CostToolDeps,
   raw: unknown,
   sessionID: string,
   needGaps: (args: Record<string, unknown>) => boolean,
+  rejectKind = false,
 ): Promise<{ args: Record<string, unknown>; input: AnalysisInput }> {
   const args = record(raw);
+  if (rejectKind && args.kind !== undefined)
+    throw new Error("kind is not supported by this tool.");
   const now = deps.now();
   const range = parsePeriod(text(args, "period"), now);
   let project = text(args, "project");
@@ -164,12 +191,24 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
   return [
     {
       name: "cost_report",
-      description: `Report where opencode cost went: cost, share, steps, average cost per step, token counts, cache-read ratio and failed-step cost, grouped by agent (default), model, provider, session, day or gap (time since the session's previous step: first, <1m, 1-5m, >5m; includes tool run and thinking time; sort is ignored for gap). Use it to find the biggest cost drivers. ${COMMON_DESCRIPTION}`,
+      description: `Report where opencode cost went: cost, share, steps, average cost per step, token counts, cache-read ratio and failed-step cost, grouped by agent (default), model, provider, session, day or gap, or two distinct of them at once as an array such as ["day","model"] (gap = time since the session's previous step: first, <1m, 1-5m, >5m; includes tool run and thinking time; sort is ignored for gap). Use it to find the biggest cost drivers. ${COMMON_DESCRIPTION}`,
       input: {
         type: "object",
         properties: {
           ...FILTER_PROPERTIES,
-          groupBy: { type: "string", enum: GROUP_BY },
+          groupBy: {
+            description:
+              "One dimension, or an array of exactly two distinct dimensions (one group per combination)",
+            oneOf: [
+              { type: "string", enum: GROUP_BY },
+              {
+                type: "array",
+                items: { type: "string", enum: GROUP_BY },
+                minItems: 2,
+                maxItems: 2,
+              },
+            ],
+          },
           sort: { type: "string", enum: SORT_BY, description: "Default cost" },
           limit: limitProperty(REPORT_MAX_LIMIT),
         },
@@ -182,10 +221,10 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
           deps,
           raw,
           context.sessionID,
-          (a) => a.groupBy === "gap",
+          (a) => [a.groupBy].flat().includes("gap"),
         );
         const report = buildReport(input, {
-          groupBy: choice(args, "groupBy", GROUP_BY) ?? "agent",
+          groupBy: groupSpec(args),
           sort: choice(args, "sort", SORT_BY) ?? "cost",
           limit: validateLimit(numberArg(args), REPORT_MAX_LIMIT),
         });
@@ -219,6 +258,35 @@ export function createCostTools(deps: CostToolDeps): CostTool[] {
         );
         if (!hotspots.complete) deps.onIncomplete();
         return { output: hotspots, content: renderHotspots(hotspots) };
+      },
+    },
+    {
+      name: "cache_breaks",
+      description: `Find prompt-cache breaks in sessions with at least 20 steps: frozen cache (15+ consecutive steps with an identical cache read while uncached input grows), full misses (a step reading nothing from cache right after one that did; the first step and the step after a compaction are excluded), cache-ratio change-points (the rolling 10-step ratio cache read / (cache read + uncached input) crossing 0.5) and the estimated waste in USD from the catalog prices (omitted when a price is unknown). Lists flagged sessions by cost and, per provider/model, flagged versus examined sessions so a provider-wide regression is visible. Never outputs prompts or message content. ${COMMON_DESCRIPTION}`,
+      input: {
+        type: "object",
+        properties: {
+          ...FILTER_PROPERTIES_NO_KIND,
+          limit: limitProperty(CACHE_BREAKS_MAX_LIMIT),
+        },
+        additionalProperties: false,
+      },
+      output,
+      options,
+      async execute(raw, context) {
+        const { args, input } = await loadInput(
+          deps,
+          raw,
+          context.sessionID,
+          () => false,
+          true,
+        );
+        const result = buildCacheBreaks(
+          input,
+          validateLimit(numberArg(args), CACHE_BREAKS_MAX_LIMIT),
+        );
+        if (!result.complete) deps.onIncomplete();
+        return { output: result, content: renderCacheBreaks(result) };
       },
     },
   ];
